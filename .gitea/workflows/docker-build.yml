@@ -1,0 +1,31 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [iAdrian]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ gitea.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Login to Gitea registry
+        run: echo "${{ secrets.REGISTRYTOKEN }}" | docker login git.ciolan.net -u "${{ secrets.REGISTRYUSER }}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          docker build \
+            -t git.ciolan.net/github-mirrors/hermes-agent:${{ gitea.sha }} \
+            -t git.ciolan.net/github-mirrors/hermes-agent:latest \
+            .
+          docker push git.ciolan.net/github-mirrors/hermes-agent:${{ gitea.sha }}
+          docker push git.ciolan.net/github-mirrors/hermes-agent:latest
