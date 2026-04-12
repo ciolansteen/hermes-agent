@@ -2,7 +2,7 @@ name: Sync upstream (NousResearch → main)
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 jobs:
