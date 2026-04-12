@@ -14,7 +14,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITEASYNCTOKEN }}
+          token: ${{ secrets.GITEASYNC_TOKEN }}
 
       - name: Add GitHub fork remote
         run: git remote add github https://github.com/ciolansteen/hermes-agent.git
@@ -33,5 +33,5 @@ jobs:
 
       - name: Push to Gitea main
         run: |
-          git remote set-url origin https://gitea-sync:${{ secrets.GITEASYNCTOKEN }}@git.ciolan.net/github-mirrors/hermes-agent.git
+          git remote set-url origin https://gitea-sync:${{ secrets.GITEASYNC_TOKEN }}@git.ciolan.net/github-mirrors/hermes-agent.git
           git push origin main
