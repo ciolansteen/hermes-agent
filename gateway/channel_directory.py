@@ -73,6 +73,8 @@ def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = _build_slack(adapter)
+            elif platform == Platform.EMAIL:
+                platforms["email"] = _build_from_sessions("email")
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
