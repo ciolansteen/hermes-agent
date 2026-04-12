@@ -33,5 +33,5 @@ jobs:
 
       - name: Push to Gitea main
         run: |
-          git remote set-url origin https://gitea-sync:${{ secrets.GITEASYNC_TOKEN }}@git.ciolan.net/github-mirrors/hermes-agent.git
+          git remote set-url origin https://iAdrian:${{ secrets.GITEASYNC_TOKEN }}@git.ciolan.net/github-mirrors/hermes-agent.git
           git push origin main
