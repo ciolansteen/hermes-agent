@@ -1,0 +1,37 @@
+name: Sync main (GitHub fork → Gitea)
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITEA_SYNC_TOKEN }}
+
+      - name: Add GitHub fork remote
+        run: git remote add github https://github.com/ciolansteen/hermes-agent.git
+
+      - name: Fetch main from GitHub fork
+        run: git fetch github main
+
+      - name: Merge fast-forward only
+        run: |
+          git config user.name  "gitea-sync[bot]"
+          git config user.email "gitea-sync@ciolan.net"
+          git merge github/main --ff-only || {
+            echo "upstream/main diverged — manual merge needed"
+            exit 1
+          }
+
+      - name: Push to Gitea main
+        run: |
+          git remote set-url origin https://gitea-sync:${{ secrets.GITEA_SYNC_TOKEN }}@git.ciolan.net/github-mirrors/hermes-agent.git
+          git push origin main
