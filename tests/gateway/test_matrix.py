@@ -108,12 +108,24 @@ def _make_fake_mautrix():
         def add_event_handler(self, event_type, handler):
             self._event_handlers.setdefault(event_type, []).append(handler)
 
+        def remove_dispatcher(self, dispatcher_cls):
+            pass
+
     class InternalEventType:
         INVITE = "internal.invite"
 
     mautrix_client.Client = Client
     mautrix_client.InternalEventType = InternalEventType
     mautrix.client = mautrix_client
+
+    # --- mautrix.client.client (needed for DecryptionDispatcher import) ---
+    mautrix_client_client = types.ModuleType("mautrix.client.client")
+
+    class DecryptionDispatcher:
+        event_type = "m.room.encrypted"
+
+    mautrix_client_client.DecryptionDispatcher = DecryptionDispatcher
+    mautrix_client.client = mautrix_client_client
 
     # --- mautrix.client.state_store ---
     mautrix_client_state_store = types.ModuleType("mautrix.client.state_store")
@@ -200,6 +212,7 @@ def _make_fake_mautrix():
         "mautrix.api": mautrix_api,
         "mautrix.types": mautrix_types,
         "mautrix.client": mautrix_client,
+        "mautrix.client.client": mautrix_client_client,
         "mautrix.client.state_store": mautrix_client_state_store,
         "mautrix.crypto": mautrix_crypto,
         "mautrix.crypto.store": mautrix_crypto_store,
@@ -1142,26 +1155,34 @@ class TestMatrixEncryptedSendFallback:
 
 
 # ---------------------------------------------------------------------------
-# E2EE: MegolmEvent key request + buffering via _on_encrypted_event
+# E2EE: MegolmEvent buffering via _HermesDecryptionDispatcher
 # ---------------------------------------------------------------------------
 
 class TestMatrixMegolmEventHandling:
     @pytest.mark.asyncio
     async def test_encrypted_event_buffers_for_retry(self):
-        """_on_encrypted_event should buffer undecrypted events for retry."""
+        """_HermesDecryptionDispatcher should buffer undecryptable events."""
+        from gateway.platforms.matrix import _HermesDecryptionDispatcher
+
         adapter = _make_adapter()
         adapter._user_id = "@bot:example.org"
         adapter._startup_ts = 0.0
         adapter._dm_rooms = {}
 
+        mock_client = MagicMock()
+        mock_client.crypto = MagicMock()
+        mock_client.crypto.decrypt_megolm_event = AsyncMock(side_effect=Exception("no session"))
+
+        dispatcher = _HermesDecryptionDispatcher(mock_client, adapter)
+
         fake_event = MagicMock()
         fake_event.room_id = "!room:example.org"
         fake_event.event_id = "$encrypted_event"
         fake_event.sender = "@alice:example.org"
+        fake_event.source = {}
 
-        await adapter._on_encrypted_event(fake_event)
+        await dispatcher.handle(fake_event)
 
-        # Should have buffered the event
         assert len(adapter._pending_megolm) == 1
         room_id, event, ts = adapter._pending_megolm[0]
         assert room_id == "!room:example.org"
@@ -1170,19 +1191,26 @@ class TestMatrixMegolmEventHandling:
     @pytest.mark.asyncio
     async def test_encrypted_event_buffer_capped(self):
         """Buffer should not grow past _MAX_PENDING_EVENTS."""
+        from gateway.platforms.matrix import _HermesDecryptionDispatcher, _MAX_PENDING_EVENTS
+
         adapter = _make_adapter()
         adapter._user_id = "@bot:example.org"
         adapter._startup_ts = 0.0
         adapter._dm_rooms = {}
 
-        from gateway.platforms.matrix import _MAX_PENDING_EVENTS
+        mock_client = MagicMock()
+        mock_client.crypto = MagicMock()
+        mock_client.crypto.decrypt_megolm_event = AsyncMock(side_effect=Exception("no session"))
+
+        dispatcher = _HermesDecryptionDispatcher(mock_client, adapter)
 
         for i in range(_MAX_PENDING_EVENTS + 10):
             evt = MagicMock()
             evt.room_id = "!room:example.org"
             evt.event_id = f"$event_{i}"
             evt.sender = "@alice:example.org"
-            await adapter._on_encrypted_event(evt)
+            evt.source = {}
+            await dispatcher.handle(evt)
 
         assert len(adapter._pending_megolm) == _MAX_PENDING_EVENTS
 
@@ -1327,11 +1355,13 @@ class TestMatrixEncryptedEventHandler:
                         assert await adapter.connect() is True
 
         # Verify event handlers were registered.
-        # In mautrix the order is: add_event_handler(EventType, callback)
+        # With _HermesDecryptionDispatcher, ROOM_ENCRYPTED is registered via
+        # dispatcher.register() (add_event_handler), not the old _on_encrypted_event.
         handler_calls = mock_client.add_event_handler.call_args_list
         registered_types = [call.args[0] for call in handler_calls]
 
-        # Should have registered handlers for ROOM_MESSAGE, REACTION, INVITE, and ROOM_ENCRYPTED
+        # Should have: ROOM_MESSAGE, REACTION, INVITE (3 explicit)
+        # plus ROOM_ENCRYPTED via _HermesDecryptionDispatcher.register()
         assert len(handler_calls) >= 4  # At minimum these four
 
         await adapter.disconnect()

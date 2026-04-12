@@ -193,6 +193,43 @@ class _CryptoStateStore:
         return list(self._joined_rooms)
 
 
+class _HermesDecryptionDispatcher:
+    """Decrypt ROOM_ENCRYPTED events; buffer failures for retry.
+
+    Replaces the default mautrix DecryptionDispatcher + a separate
+    _on_encrypted_event handler.  A single handler eliminates the dedup
+    race where _on_encrypted_event (zero awaits) marks the event_id
+    before the async DecryptionDispatcher can dispatch the decrypted event.
+    """
+
+    event_type = EventType.ROOM_ENCRYPTED
+
+    def __init__(self, client: Any, adapter: "MatrixAdapter"):
+        self.client = client
+        self._adapter = adapter
+
+    def register(self) -> None:
+        self.client.add_event_handler(self.event_type, self.handle)
+
+    async def handle(self, evt: Any) -> None:
+        try:
+            decrypted = await self.client.crypto.decrypt_megolm_event(evt)
+        except Exception:
+            room_id = str(getattr(evt, "room_id", ""))
+            event_id = str(getattr(evt, "event_id", ""))
+            logger.warning(
+                "Matrix: could not decrypt event %s in %s — buffering for retry",
+                event_id, room_id,
+            )
+            self._adapter._pending_megolm.append((room_id, evt, time.time()))
+            if len(self._adapter._pending_megolm) > _MAX_PENDING_EVENTS:
+                self._adapter._pending_megolm = (
+                    self._adapter._pending_megolm[-_MAX_PENDING_EVENTS:]
+                )
+            return
+        self.client.dispatch_event(decrypted, evt.source)
+
+
 class MatrixAdapter(BasePlatformAdapter):
     """Gateway adapter for Matrix (any homeserver)."""
 
@@ -365,6 +402,35 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 return False
 
+            # Re-verify: the server may accept the OTKs (HTTP 200) but
+            # silently ignore new device keys when identity keys are
+            # immutable for the existing device.
+            try:
+                resp2 = await client.query_keys({client.mxid: [client.device_id]})
+                dk2 = (getattr(resp2, "device_keys", {}) or {})
+                ud2 = (dk2.get(str(client.mxid)) or {})
+                keys2 = ud2.get(str(client.device_id))
+                if keys2:
+                    server_ed2 = None
+                    for kid, kval in (getattr(keys2, "keys", {}) or {}).items():
+                        if str(kid).startswith("ed25519:"):
+                            server_ed2 = str(kval)
+                            break
+                    if server_ed2 != local_ed25519:
+                        logger.error(
+                            "Matrix: device %s has immutable identity keys on the "
+                            "server that don't match this installation. Generate a "
+                            "new access token with a fresh device: "
+                            "hermes gateway setup --platform matrix",
+                            client.device_id,
+                        )
+                        return False
+            except Exception as exc:
+                logger.error(
+                    "Matrix: failed to re-verify device keys after upload: %s", exc,
+                )
+                return False
+
         return True
 
     # ------------------------------------------------------------------
@@ -523,6 +589,13 @@ class MatrixAdapter(BasePlatformAdapter):
                         logger.warning("Matrix: recovery key verification failed: %s", exc)
 
                 client.crypto = olm
+
+                # Replace the auto-registered DecryptionDispatcher with our
+                # single-path handler that buffers failures for retry.
+                from mautrix.client.client import DecryptionDispatcher
+                client.remove_dispatcher(DecryptionDispatcher)
+                _HermesDecryptionDispatcher(client, self).register()
+
                 logger.info(
                     "Matrix: E2EE enabled (store: %s%s)",
                     str(_CRYPTO_DB_PATH),
@@ -543,9 +616,6 @@ class MatrixAdapter(BasePlatformAdapter):
         client.add_event_handler(EventType.REACTION, self._on_reaction)
         client.add_event_handler(IntEvt.INVITE, self._on_invite)
 
-        if self._encryption and getattr(client, "crypto", None):
-            client.add_event_handler(EventType.ROOM_ENCRYPTED, self._on_encrypted_event)
-
         # Initial sync to catch up, then start background sync.
         self._startup_ts = time.time()
         self._closing = False
@@ -554,7 +624,8 @@ class MatrixAdapter(BasePlatformAdapter):
             sync_data = await client.sync(timeout=10000, full_state=True)
             if isinstance(sync_data, dict):
                 rooms_join = sync_data.get("rooms", {}).get("join", {})
-                self._joined_rooms = set(rooms_join.keys())
+                self._joined_rooms.clear()
+                self._joined_rooms.update(rooms_join.keys())
                 # Store the next_batch token so incremental syncs start
                 # from where the initial sync left off.
                 nb = sync_data.get("next_batch")
@@ -1034,12 +1105,6 @@ class MatrixAdapter(BasePlatformAdapter):
                 getattr(event, "event_id", "?"),
             )
 
-            # Route to the appropriate handler.
-            # Remove from dedup set so _on_room_message doesn't drop it
-            # (the encrypted event ID was already registered by _on_encrypted_event).
-            decrypted_id = str(getattr(decrypted, "event_id", getattr(event, "event_id", "")))
-            if decrypted_id:
-                self._processed_events_set.discard(decrypted_id)
             try:
                 await self._on_room_message(decrypted)
             except Exception as exc:
@@ -1370,23 +1435,6 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
-
-    async def _on_encrypted_event(self, event: Any) -> None:
-        """Handle encrypted events that could not be auto-decrypted."""
-        room_id = str(getattr(event, "room_id", ""))
-        event_id = str(getattr(event, "event_id", ""))
-
-        if self._is_duplicate_event(event_id):
-            return
-
-        logger.warning(
-            "Matrix: could not decrypt event %s in %s — buffering for retry",
-            event_id, room_id,
-        )
-
-        self._pending_megolm.append((room_id, event, time.time()))
-        if len(self._pending_megolm) > _MAX_PENDING_EVENTS:
-            self._pending_megolm = self._pending_megolm[-_MAX_PENDING_EVENTS:]
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited."""
