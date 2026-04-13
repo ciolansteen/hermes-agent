@@ -75,6 +75,9 @@ def _make_fake_mautrix():
         UNVERIFIED = 0
         VERIFIED = 1
 
+    class DeviceID(str):
+        pass
+
     class PaginationDirection:
         BACKWARD = "b"
         FORWARD = "f"
@@ -88,6 +91,7 @@ def _make_fake_mautrix():
     mautrix_types.RoomCreatePreset = RoomCreatePreset
     mautrix_types.PresenceState = PresenceState
     mautrix_types.TrustState = TrustState
+    mautrix_types.DeviceID = DeviceID
     mautrix_types.PaginationDirection = PaginationDirection
     mautrix.types = mautrix_types
 
@@ -104,9 +108,13 @@ def _make_fake_mautrix():
             self.sync_store = sync_store
             self.crypto = None
             self._event_handlers = {}
+            self._dispatchers = []
 
         def add_event_handler(self, event_type, handler):
             self._event_handlers.setdefault(event_type, []).append(handler)
+
+        def add_dispatcher(self, dispatcher_cls):
+            self._dispatchers.append(dispatcher_cls)
 
         def remove_dispatcher(self, dispatcher_cls):
             pass
@@ -117,6 +125,15 @@ def _make_fake_mautrix():
     mautrix_client.Client = Client
     mautrix_client.InternalEventType = InternalEventType
     mautrix.client = mautrix_client
+
+    # --- mautrix.client.dispatcher (needed for MembershipEventDispatcher import) ---
+    mautrix_client_dispatcher = types.ModuleType("mautrix.client.dispatcher")
+
+    class MembershipEventDispatcher:
+        pass
+
+    mautrix_client_dispatcher.MembershipEventDispatcher = MembershipEventDispatcher
+    mautrix_client.dispatcher = mautrix_client_dispatcher
 
     # --- mautrix.client.client (needed for DecryptionDispatcher import) ---
     mautrix_client_client = types.ModuleType("mautrix.client.client")
@@ -185,9 +202,16 @@ def _make_fake_mautrix():
             self.account_id = account_id
             self.pickle_key = pickle_key
             self.db = db
+            self._device_id = ""
 
         async def open(self):
             pass
+
+        async def get_device_id(self):
+            return self._device_id or None
+
+        async def put_device_id(self, device_id):
+            self._device_id = device_id
 
     mautrix_crypto_store_asyncpg.PgCryptoStore = PgCryptoStore
 
@@ -213,6 +237,7 @@ def _make_fake_mautrix():
         "mautrix.types": mautrix_types,
         "mautrix.client": mautrix_client,
         "mautrix.client.client": mautrix_client_client,
+        "mautrix.client.dispatcher": mautrix_client_dispatcher,
         "mautrix.client.state_store": mautrix_client_state_store,
         "mautrix.crypto": mautrix_crypto,
         "mautrix.crypto.store": mautrix_crypto_store,
