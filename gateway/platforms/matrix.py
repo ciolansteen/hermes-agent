@@ -569,6 +569,14 @@ class MatrixAdapter(BasePlatformAdapter):
 
                 await olm.load()
 
+                # Ensure the crypto store has the correct device_id. mautrix
+                # initialises _device_id to "" and never back-fills it from
+                # client.device_id, so OTK uploads silently use an empty
+                # device_id and Synapse rejects them.
+                if client.device_id and not await crypto_store.get_device_id():
+                    from mautrix.types import DeviceID
+                    await crypto_store.put_device_id(DeviceID(client.device_id))
+
                 # Verify our device keys are still on the homeserver.
                 if not await self._verify_device_keys_on_server(client, olm):
                     await crypto_db.stop()
