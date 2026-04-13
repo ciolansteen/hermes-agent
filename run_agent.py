@@ -1748,10 +1748,25 @@ class AIAgent:
 
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
+
+            # Read user-configured context_length for the compression model.
+            # Custom endpoints often don't support /models API queries so
+            # get_model_context_length() falls through to the 128K default,
+            # ignoring the explicit config value.  Pass it as the highest-
+            # priority hint so the configured value is always respected.
+            _aux_cfg = (self.config or {}).get("auxiliary", {}).get("compression", {})
+            _aux_context_config = _aux_cfg.get("context_length") if isinstance(_aux_cfg, dict) else None
+            if _aux_context_config is not None:
+                try:
+                    _aux_context_config = int(_aux_context_config)
+                except (TypeError, ValueError):
+                    _aux_context_config = None
+
             aux_context = get_model_context_length(
                 aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
+                config_context_length=_aux_context_config,
             )
 
             threshold = self.context_compressor.threshold_tokens
@@ -5376,13 +5391,22 @@ class AIAgent:
                 # a new API call, creating a duplicate message.  Return a
                 # partial "stop" response instead so the outer loop treats this
                 # turn as complete (no retry, no fallback).
+                # Recover whatever content was already streamed to the user.
+                # _current_streamed_assistant_text accumulates text fired
+                # through _fire_stream_delta, so it has exactly what the
+                # user saw before the connection died.
+                _partial_text = (
+                    getattr(self, "_current_streamed_assistant_text", "") or ""
+                ).strip() or None
                 logger.warning(
                     "Partial stream delivered before error; returning stub "
-                    "response to prevent duplicate messages: %s",
+                    "response with %s chars of recovered content to prevent "
+                    "duplicate messages: %s",
+                    len(_partial_text or ""),
                     result["error"],
                 )
                 _stub_msg = SimpleNamespace(
-                    role="assistant", content=None, tool_calls=None,
+                    role="assistant", content=_partial_text, tool_calls=None,
                     reasoning_content=None,
                 )
                 return SimpleNamespace(
@@ -5841,11 +5865,12 @@ class AIAgent:
         """True when using an anthropic-compatible endpoint that preserves dots in model names.
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
         MiniMax keeps dots (e.g. MiniMax-M2.7).
-        OpenCode Go keeps dots (e.g. minimax-m2.7)."""
-        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go"}:
+        OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
+        ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1)."""
+        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go", "opencode-zen", "zai"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/go" in base
+        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/" in base or "bigmodel.cn" in base
 
     def _is_qwen_portal(self) -> bool:
         """Return True when the base URL targets Qwen Portal."""
@@ -9873,6 +9898,30 @@ class AIAgent:
                     
                     # Check if response only has think block with no actual content after it
                     if not self._has_content_after_think_block(final_response):
+                        # ── Partial stream recovery ─────────────────────
+                        # If content was already streamed to the user before
+                        # the connection died, use it as the final response
+                        # instead of falling through to prior-turn fallback
+                        # or wasting API calls on retries.
+                        _partial_streamed = (
+                            getattr(self, "_current_streamed_assistant_text", "") or ""
+                        )
+                        if self._has_content_after_think_block(_partial_streamed):
+                            _turn_exit_reason = "partial_stream_recovery"
+                            _recovered = self._strip_think_blocks(_partial_streamed).strip()
+                            logger.info(
+                                "Partial stream content delivered (%d chars) "
+                                "— using as final response",
+                                len(_recovered),
+                            )
+                            self._emit_status(
+                                "↻ Stream interrupted — using delivered content "
+                                "as final response"
+                            )
+                            final_response = _recovered
+                            self._response_was_previewed = True
+                            break
+
                         # If the previous turn already delivered real content alongside
                         # tool calls (e.g. "You're welcome!" + memory save), the model
                         # has nothing more to say. Use the earlier content immediately
