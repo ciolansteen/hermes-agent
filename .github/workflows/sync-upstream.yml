@@ -15,6 +15,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add upstream remote
         run: git remote add upstream https://github.com/NousResearch/hermes-agent.git
