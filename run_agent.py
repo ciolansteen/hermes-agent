@@ -40,6 +40,7 @@ from types import SimpleNamespace
 import urllib.request
 import uuid
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs, urlunparse
 from openai import OpenAI
 import fire
 from datetime import datetime
@@ -1033,12 +1034,16 @@ class AIAgent:
         # surface.
         # When api_mode was explicitly provided, respect it — the user
         # knows what their endpoint supports (#10473).
+        # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
+        # does NOT support the Responses API — skip the upgrade for Azure
+        # (openai.azure.com), even though it looks OpenAI-compatible.
         if (
             api_mode is None
             and self.api_mode == "chat_completions"
             and self.provider != "copilot-acp"
             and not str(self.base_url or "").lower().startswith("acp://copilot")
             and not str(self.base_url or "").lower().startswith("acp+tcp://")
+            and not self._is_azure_openai_url()
             and (
                 self._is_direct_openai_url()
                 or self._provider_model_requires_responses_api(
@@ -1314,7 +1319,22 @@ class AIAgent:
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
-                client_kwargs = {"api_key": api_key, "base_url": base_url}
+                # Extract query params (e.g. Azure api-version) from base_url
+                # and pass via default_query to prevent loss during SDK URL
+                # joining (httpx drops query string when joining paths).
+                _parsed_url = urlparse(base_url)
+                if _parsed_url.query:
+                    _clean_url = urlunparse(_parsed_url._replace(query=""))
+                    _query_params = {
+                        k: v[0] for k, v in parse_qs(_parsed_url.query).items()
+                    }
+                    client_kwargs = {
+                        "api_key": api_key,
+                        "base_url": _clean_url,
+                        "default_query": _query_params,
+                    }
+                else:
+                    client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if _provider_timeout is not None:
                     client_kwargs["timeout"] = _provider_timeout
                 if self.provider == "copilot-acp":
@@ -1765,43 +1785,64 @@ class AIAgent:
         # Store for reuse in switch_model (so config override persists across model switches)
         self._config_context_length = _config_context_length
 
+        # Resolve custom_providers list once for reuse below (startup
+        # context-length override and plugin context-engine init).
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            _custom_providers = get_compatible_custom_providers(_agent_cfg)
+        except Exception:
+            _custom_providers = _agent_cfg.get("custom_providers")
+            if not isinstance(_custom_providers, list):
+                _custom_providers = []
+
         # Check custom_providers per-model context_length
-        if _config_context_length is None:
+        if _config_context_length is None and _custom_providers:
             try:
-                from hermes_cli.config import get_compatible_custom_providers
-                _custom_providers = get_compatible_custom_providers(_agent_cfg)
+                from hermes_cli.config import get_custom_provider_context_length
+                _cp_ctx_resolved = get_custom_provider_context_length(
+                    model=self.model,
+                    base_url=self.base_url,
+                    custom_providers=_custom_providers,
+                )
+                if _cp_ctx_resolved:
+                    _config_context_length = int(_cp_ctx_resolved)
             except Exception:
-                _custom_providers = _agent_cfg.get("custom_providers")
-                if not isinstance(_custom_providers, list):
-                    _custom_providers = []
-            for _cp_entry in _custom_providers:
-                if not isinstance(_cp_entry, dict):
-                    continue
-                _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
-                if _cp_url and _cp_url == self.base_url.rstrip("/"):
-                    _cp_models = _cp_entry.get("models", {})
-                    if isinstance(_cp_models, dict):
-                        _cp_model_cfg = _cp_models.get(self.model, {})
-                        if isinstance(_cp_model_cfg, dict):
-                            _cp_ctx = _cp_model_cfg.get("context_length")
-                            if _cp_ctx is not None:
-                                try:
-                                    _config_context_length = int(_cp_ctx)
-                                except (TypeError, ValueError):
-                                    logger.warning(
-                                        "Invalid context_length for model %r in "
-                                        "custom_providers: %r — must be a plain "
-                                        "integer (e.g. 256000, not '256K'). "
-                                        "Falling back to auto-detection.",
-                                        self.model, _cp_ctx,
-                                    )
-                                    print(
-                                        f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
-                                        f"  Must be a plain integer (e.g. 256000, not '256K').\n"
-                                        f"  Falling back to auto-detected context window.\n",
-                                        file=sys.stderr,
-                                    )
-                    break
+                _cp_ctx_resolved = None
+
+            # Surface a clear warning if the user set a context_length but it
+            # wasn't a valid positive int — the helper silently skips those.
+            if _config_context_length is None:
+                _target = self.base_url.rstrip("/") if self.base_url else ""
+                for _cp_entry in _custom_providers:
+                    if not isinstance(_cp_entry, dict):
+                        continue
+                    _cp_url = (_cp_entry.get("base_url") or "").rstrip("/")
+                    if _target and _cp_url == _target:
+                        _cp_models = _cp_entry.get("models", {})
+                        if isinstance(_cp_models, dict):
+                            _cp_model_cfg = _cp_models.get(self.model, {})
+                            if isinstance(_cp_model_cfg, dict):
+                                _cp_ctx = _cp_model_cfg.get("context_length")
+                                if _cp_ctx is not None:
+                                    try:
+                                        _parsed = int(_cp_ctx)
+                                        if _parsed <= 0:
+                                            raise ValueError
+                                    except (TypeError, ValueError):
+                                        logger.warning(
+                                            "Invalid context_length for model %r in "
+                                            "custom_providers: %r — must be a positive "
+                                            "integer (e.g. 256000, not '256K'). "
+                                            "Falling back to auto-detection.",
+                                            self.model, _cp_ctx,
+                                        )
+                                        print(
+                                            f"\n⚠ Invalid context_length for model {self.model!r} in custom_providers: {_cp_ctx!r}\n"
+                                            f"  Must be a positive integer (e.g. 256000, not '256K').\n"
+                                            f"  Falling back to auto-detected context window.\n",
+                                            file=sys.stderr,
+                                        )
+                        break
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -1851,6 +1892,7 @@ class AIAgent:
                 api_key=getattr(self, "api_key", ""),
                 config_context_length=_config_context_length,
                 provider=self.provider,
+                custom_providers=_custom_providers,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -2141,12 +2183,23 @@ class AIAgent:
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
             from agent.model_metadata import get_model_context_length
+            # Re-read custom_providers from live config so per-model
+            # context_length overrides are honored when switching to a
+            # custom provider mid-session (closes #15779).
+            _sm_custom_providers = None
+            try:
+                from hermes_cli.config import load_config, get_compatible_custom_providers
+                _sm_cfg = load_config()
+                _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            except Exception:
+                _sm_custom_providers = None
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
                 api_key=self.api_key,
                 provider=self.provider,
                 config_context_length=getattr(self, "_config_context_length", None),
+                custom_providers=_sm_custom_providers,
             )
             self.context_compressor.update_model(
                 model=self.model,
@@ -2504,6 +2557,22 @@ class AIAgent:
             )
         return hostname == "api.openai.com"
 
+    def _is_azure_openai_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets Azure OpenAI.
+
+        Azure OpenAI exposes an OpenAI-compatible endpoint at
+        ``{resource}.openai.azure.com/openai/v1`` that accepts the
+        standard ``openai`` Python client.  Unlike api.openai.com it
+        does NOT support the Responses API — gpt-5.x models are served
+        on the regular ``/chat/completions`` path — so routing decisions
+        must treat Azure separately from direct OpenAI.
+        """
+        if base_url is not None:
+            url = str(base_url).lower()
+        else:
+            url = getattr(self, "_base_url_lower", "") or ""
+        return "openai.azure.com" in url
+
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
 
@@ -2675,12 +2744,14 @@ class AIAgent:
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
-        
+
         OpenAI's newer models (gpt-4o, o-series, gpt-5+) require
-        'max_completion_tokens'. OpenRouter, local models, and older
+        'max_completion_tokens'. Azure OpenAI also requires
+        'max_completion_tokens' for gpt-5.x models served via the
+        OpenAI-compatible endpoint. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
         """
-        if self._is_direct_openai_url():
+        if self._is_direct_openai_url() or self._is_azure_openai_url():
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -5438,6 +5509,11 @@ class AIAgent:
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
             return False
+        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
+        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
+        _base = getattr(self, "_anthropic_base_url", "") or ""
+        if "azure.com" in _base:
+            return False
 
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
@@ -6794,10 +6870,15 @@ class AIAgent:
             # Determine api_mode from provider / base URL / model
             fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
+            _fb_is_azure = self._is_azure_openai_url(fb_base_url)
             if fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
             elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
                 fb_api_mode = "anthropic_messages"
+            elif _fb_is_azure:
+                # Azure OpenAI serves gpt-5.x on /chat/completions — does NOT
+                # support the Responses API. Stay on chat_completions.
+                fb_api_mode = "chat_completions"
             elif self._is_direct_openai_url(fb_base_url):
                 fb_api_mode = "codex_responses"
             elif self._provider_model_requires_responses_api(
