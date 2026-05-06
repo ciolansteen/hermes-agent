@@ -353,7 +353,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
-        if not thread_id:
+        # Mirrors _message_thread_id_for_send: the General forum topic (thread id
+        # "1") is represented as "no thread id" on the wire. User-created topics
+        # keep their real id so typing stays scoped to that topic.
+        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
             return None
         return int(thread_id)
 
@@ -512,6 +515,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, attempt,
             )
             self._polling_network_error_count = 0
+            # start_polling() returning is necessary but not sufficient:
+            # PTB's Updater can be left in a state where `running` is True
+            # but the underlying long-poll task is wedged on a stale httpx
+            # connection and never makes progress. No error_callback fires
+            # in that state, so the reconnect ladder won't advance on its
+            # own. Schedule a deferred probe to detect the wedge and
+            # re-enter the ladder if needed.
+            if not self.has_fatal_error:
+                probe = asyncio.ensure_future(self._verify_polling_after_reconnect())
+                self._background_tasks.add(probe)
+                probe.add_done_callback(self._background_tasks.discard)
         except Exception as retry_err:
             logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, retry_err)
             # start_polling failed — polling is dead and no further error
@@ -522,6 +536,50 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+
+    async def _verify_polling_after_reconnect(self) -> None:
+        """Heartbeat probe scheduled after a successful reconnect.
+
+        PTB's Updater can survive a botched stop()+start_polling() cycle
+        with `running=True` but a wedged consumer task. No error callback
+        fires, so the reconnect ladder doesn't advance on its own. This
+        probe detects the wedge by:
+
+        1. Sleeping HEARTBEAT_PROBE_DELAY so a healthy long-poll has time
+           to complete at least one cycle.
+        2. Verifying `Updater.running` is still True.
+        3. Probing the bot endpoint with a tight asyncio timeout. A
+           wedged httpx pool fails this probe; a healthy one returns
+           well under the timeout.
+
+        On any failure, re-enter the reconnect ladder so the existing
+        MAX_NETWORK_RETRIES path can ultimately escalate to fatal-error.
+        """
+        HEARTBEAT_PROBE_DELAY = 60
+        PROBE_TIMEOUT = 10
+
+        await asyncio.sleep(HEARTBEAT_PROBE_DELAY)
+
+        if self.has_fatal_error:
+            return
+        if not (self._app and self._app.updater and self._app.updater.running):
+            logger.warning(
+                "[%s] Updater not running %ds after reconnect — treating as wedged",
+                self.name, HEARTBEAT_PROBE_DELAY,
+            )
+            await self._handle_polling_network_error(
+                RuntimeError("Updater not running after reconnect heartbeat")
+            )
+            return
+
+        try:
+            await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+        except Exception as probe_err:
+            logger.warning(
+                "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
+                self.name, HEARTBEAT_PROBE_DELAY, probe_err,
+            )
+            await self._handle_polling_network_error(probe_err)
 
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
@@ -632,6 +690,29 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, name, chat_id, e,
                 )
             return None
+
+    async def rename_dm_topic(
+        self,
+        chat_id: int,
+        thread_id: int,
+        name: str,
+    ) -> None:
+        """Rename a forum topic in a private (DM) chat."""
+        if not self._bot:
+            return
+        try:
+            chat_id_arg = int(chat_id)
+        except (TypeError, ValueError):
+            chat_id_arg = chat_id
+        await self._bot.edit_forum_topic(
+            chat_id=chat_id_arg,
+            message_thread_id=int(thread_id),
+            name=name,
+        )
+        logger.info(
+            "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
+            self.name, chat_id, thread_id, name,
+        )
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int) -> None:
         """Save a newly created thread_id back into config.yaml so it persists across restarts."""
@@ -2212,13 +2293,54 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            logger.error(
-                "[%s] Failed to send Telegram local image, falling back to base adapter: %s",
-                self.name,
-                e,
-                exc_info=True,
+            error_str = str(e)
+            # Dimension-related errors are the expected case for valid image
+            # files that Telegram just refuses as photos (screenshots, extreme
+            # aspect ratios). Log at INFO because the document fallback is
+            # the correct path. Any other send_photo failure also falls back
+            # to document (rate limits, corrupt file markers, format edge
+            # cases), but at WARNING because it's unexpected and worth
+            # surfacing in logs.
+            is_dim_error = (
+                "Photo_invalid_dimensions" in error_str
+                or "PHOTO_INVALID_DIMENSIONS" in error_str
             )
-            return await super().send_image_file(chat_id, image_path, caption, reply_to)
+            if is_dim_error:
+                logger.info(
+                    "[%s] Image dimensions exceed Telegram photo limits, "
+                    "sending as document: %s",
+                    self.name,
+                    image_path,
+                )
+            else:
+                logger.warning(
+                    "[%s] Failed to send Telegram local image as photo, "
+                    "trying document fallback: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
+            # Fallback to sending as document (file) — no dimension limit,
+            # only 50MB size limit. If even that fails, fall back to the
+            # base adapter's text-only "Image: /path" rendering.
+            try:
+                return await self.send_document(
+                    chat_id=chat_id,
+                    file_path=image_path,
+                    caption=caption,
+                    file_name=os.path.basename(image_path),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            except Exception as doc_err:
+                logger.error(
+                    "[%s] Failed to send Telegram local image as document, "
+                    "falling back to base adapter: %s",
+                    self.name,
+                    doc_err,
+                    exc_info=True,
+                )
+                return await super().send_image_file(chat_id, image_path, caption, reply_to)
 
     async def send_document(
         self,
@@ -2389,21 +2511,16 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 _typing_thread = self._metadata_thread_id(metadata)
                 message_thread_id = self._message_thread_id_for_typing(_typing_thread)
-                try:
-                    await self._bot.send_chat_action(
-                        chat_id=int(chat_id),
-                        action="typing",
-                        message_thread_id=message_thread_id,
-                    )
-                except Exception as e:
-                    if message_thread_id is not None and self._is_thread_not_found_error(e):
-                        await self._bot.send_chat_action(
-                            chat_id=int(chat_id),
-                            action="typing",
-                            message_thread_id=None,
-                        )
-                    else:
-                        raise
+                # No retry-without-thread fallback here: _message_thread_id_for_typing
+                # already maps the forum General topic to None, so any non-None value
+                # reaching this call is a user-created topic. If Telegram rejects it
+                # (e.g. topic deleted mid-session), we swallow the failure rather than
+                # showing a typing indicator in the wrong chat/All Messages.
+                await self._bot.send_chat_action(
+                    chat_id=int(chat_id),
+                    action="typing",
+                    message_thread_id=message_thread_id,
+                )
             except Exception as e:
                 # Typing failures are non-fatal; log at debug level only.
                 logger.debug(
