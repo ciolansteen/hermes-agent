@@ -987,6 +987,7 @@ def _run_checkpoint_auto_maintenance() -> None:
             retention_days=int(cfg.get("retention_days", 7)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
             delete_orphans=bool(cfg.get("delete_orphans", True)),
+            max_total_size_mb=int(cfg.get("max_total_size_mb", 500)),
         )
     except Exception as exc:
         logger.debug("checkpoint auto-maintenance skipped: %s", exc)
@@ -1407,7 +1408,13 @@ def _cprint(text: str):
 
     import asyncio as _asyncio
     try:
-        current_loop = _asyncio.get_event_loop_policy().get_event_loop()
+        # Use get_running_loop() instead of get_event_loop() to avoid the
+        # DeprecationWarning / RuntimeWarning emitted by Python 3.10+ when
+        # get_event_loop() is called from a thread that has no current event
+        # loop set (e.g. the process_loop background thread).  Fixes #19285.
+        current_loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
     except Exception:
         current_loop = None
     # Same thread as the app's loop → safe to print directly.
@@ -1549,7 +1556,21 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
     except Exception:
         resolved = path
 
-    if not resolved.exists() or not resolved.is_file():
+    # Path.exists() / is_file() invoke os.stat(), which raises OSError when
+    # the candidate string is structurally invalid as a path — most commonly
+    # ENAMETOOLONG (errno 63 on macOS, errno 36 on Linux) when the input
+    # exceeds NAME_MAX (typically 255 bytes). This bites pasted slash
+    # commands like `/goal <long prose>` because `_detect_file_drop()`'s
+    # `starts_like_path` prefilter accepts any input starting with `/`,
+    # then this resolver tries to stat it before short-circuiting on the
+    # slash-command path. Without this guard the OSError propagates up to
+    # the process_loop catch-all in _interactive_loop and the user input
+    # is silently lost (the warning ends up in agent.log but the user sees
+    # nothing — the prompt just hangs).
+    try:
+        if not resolved.exists() or not resolved.is_file():
+            return None
+    except OSError:
         return None
     return resolved
 
@@ -1757,6 +1778,20 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
     "\x1b[0m"      # reset text attributes
     "\x1b[?25h"    # ensure cursor visible
 )
+
+
+def _bind_prompt_submit_keys(kb, handler) -> None:
+    """Bind both CR and LF terminal Enter forms to the submit handler."""
+    for key in ("enter", "c-j"):
+        kb.add(key)(handler)
+
+
+def _disable_prompt_toolkit_cpr_warning(app) -> None:
+    """Let prompt_toolkit fall back from CPR without printing into the prompt."""
+    try:
+        app.renderer.cpr_not_supported_callback = None
+    except Exception:
+        pass
 
 
 def _strip_leaked_terminal_responses_with_meta(text: str) -> tuple[str, bool]:
@@ -2273,7 +2308,9 @@ class HermesCLI:
         if isinstance(cp_cfg, bool):
             cp_cfg = {"enabled": cp_cfg}
         self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
-        self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 50)
+        self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 20)
+        self.checkpoint_max_total_size_mb = cp_cfg.get("max_total_size_mb", 500)
+        self.checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
         self.pass_session_id = pass_session_id
         # --ignore-rules: honor either the constructor flag or the env var set
         # by `hermes chat --ignore-rules` in hermes_cli/main.py. When true we
@@ -2377,6 +2414,11 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Tracks whether the turn that just finished was interrupted via
+        # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
+        # don't auto-queue another continuation on top of a user-cancelled
+        # turn (which would make Ctrl+C feel like it did nothing).
+        self._last_turn_interrupted = False
         self._should_exit = False
         self._last_ctrl_c_time = 0
         self._clarify_state = None
@@ -2539,6 +2581,15 @@ class HermesCLI:
         if percent_used >= 50:
             return "class:status-bar-warn"
         return "class:status-bar-good"
+
+    @staticmethod
+    def _compression_count_style(count: int) -> str:
+        """Return a style class reflecting context compression pressure."""
+        if count >= 10:
+            return "class:status-bar-bad"
+        if count >= 5:
+            return "class:status-bar-warn"
+        return "class:status-bar-dim"
 
     def _build_context_bar(self, percent_used: Optional[int], width: int = 10) -> str:
         safe_percent = max(0, min(100, percent_used or 0))
@@ -2823,6 +2874,9 @@ class HermesCLI:
                 return self._trim_status_bar_text(text, width)
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                compressions = snapshot.get("compressions", 0)
+                if compressions:
+                    parts.append(f"🗜️ {compressions}")
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
@@ -2833,7 +2887,10 @@ class HermesCLI:
             else:
                 context_label = "ctx --"
 
+            compressions = snapshot.get("compressions", 0)
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            if compressions:
+                parts.append(f"🗜️ {compressions}")
             parts.append(duration_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed:
@@ -2867,15 +2924,21 @@ class HermesCLI:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
                 if width < 76:
+                    compressions = snapshot.get("compressions", 0)
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
+                    ]
+                    if compressions:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
+                    frags.extend([
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                         ("class:status-bar", " "),
-                    ]
+                    ])
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
@@ -2885,6 +2948,7 @@ class HermesCLI:
                         context_label = "ctx --"
 
                     bar_style = self._status_bar_context_style(percent)
+                    compressions = snapshot.get("compressions", 0)
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
@@ -2894,9 +2958,14 @@ class HermesCLI:
                         (bar_style, self._build_context_bar(percent)),
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
+                    ]
+                    if compressions:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
+                    frags.extend([
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", duration_label),
-                    ]
+                    ])
                     # Position 7: per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
                     if prompt_elapsed:
@@ -3845,6 +3914,8 @@ class HermesCLI:
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+                checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
+                checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
                 skip_context_files=self.ignore_rules,
                 skip_memory=self.ignore_rules,
@@ -5738,12 +5809,15 @@ class HermesCLI:
         self.model = result.new_model
         self.provider = result.target_provider
         self.requested_provider = result.target_provider
+        # Always overwrite explicit overrides so stale credentials from the
+        # previous provider (e.g. Ollama api_key/base_url) don't leak into
+        # the new provider's credential resolution on the next turn.
+        self._explicit_api_key = result.api_key
+        self._explicit_base_url = result.base_url
         if result.api_key:
             self.api_key = result.api_key
-            self._explicit_api_key = result.api_key
         if result.base_url:
             self.base_url = result.base_url
-            self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
 
@@ -5961,12 +6035,15 @@ class HermesCLI:
         self.model = result.new_model
         self.provider = result.target_provider
         self.requested_provider = result.target_provider
+        # Always overwrite explicit overrides so stale credentials from the
+        # previous provider (e.g. Ollama api_key/base_url) don't leak into
+        # the new provider's credential resolution on the next turn.
+        self._explicit_api_key = result.api_key
+        self._explicit_base_url = result.base_url
         if result.api_key:
             self.api_key = result.api_key
-            self._explicit_api_key = result.api_key
         if result.base_url:
             self.base_url = result.base_url
-            self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
 
@@ -7451,6 +7528,15 @@ class HermesCLI:
         priority and we'll re-judge after that turn). If judge says done,
         mark it done and tell the user. If judge says continue and we're
         under budget, push the continuation prompt onto the queue.
+
+        Interrupt handling: if the turn was user-cancelled (Ctrl+C), we
+        AUTO-PAUSE the goal instead of judging + re-queuing. Otherwise
+        Ctrl+C feels like it did nothing — the judge runs on whatever
+        partial output landed, almost always says "continue", and the
+        loop keeps going. Auto-pause keeps the goal recoverable via
+        ``/goal resume`` once the user has sorted out what they want.
+        The empty-response skip mirrors the gateway guard at
+        ``_handle_message`` in ``gateway/run.py``.
         """
         mgr = self._get_goal_manager()
         if mgr is None or not mgr.is_active():
@@ -7464,6 +7550,22 @@ class HermesCLI:
                 return
         except Exception:
             pass
+
+        # If the turn was user-interrupted (Ctrl+C), auto-pause the goal
+        # and bail. The judge call would almost always return "continue"
+        # on the partial output and immediately re-queue another turn,
+        # which is exactly what the user cancelled. Pausing (rather than
+        # silently skipping) is the observable, recoverable behavior.
+        if getattr(self, "_last_turn_interrupted", False):
+            try:
+                mgr.pause(reason="user-interrupted (Ctrl+C)")
+            except Exception as exc:
+                logging.debug("goal pause-on-interrupt failed: %s", exc)
+            _cprint(
+                f"  {_DIM}⏸ Goal paused — turn was interrupted. "
+                f"Use /goal resume to continue, or /goal clear to stop.{_RST}"
+            )
+            return
 
         # Extract the agent's final response for this turn.
         last_response = ""
@@ -7485,6 +7587,13 @@ class HermesCLI:
                     break
         except Exception:
             last_response = ""
+
+        # Skip judging on empty/whitespace-only responses. These are almost
+        # always transient failures (API error, empty stream) where the
+        # judge would say "continue" and trip the consecutive-parse-failures
+        # backstop unnecessarily. Mirrors the gateway guard.
+        if not last_response.strip():
+            return
 
         decision = mgr.evaluate_after_turn(last_response, user_initiated=True)
         msg = decision.get("message") or ""
@@ -7925,6 +8034,7 @@ class HermesCLI:
         output_tokens = getattr(agent, "session_output_tokens", 0) or 0
         cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
         cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
+        reasoning_tokens = getattr(agent, "session_reasoning_tokens", 0) or 0
         prompt = agent.session_prompt_tokens
         completion = agent.session_completion_tokens
         total = agent.session_total_tokens
@@ -7956,6 +8066,8 @@ class HermesCLI:
         print(f"  Cache read tokens:         {cache_read_tokens:>10,}")
         print(f"  Cache write tokens:        {cache_write_tokens:>10,}")
         print(f"  Output tokens:             {output_tokens:>10,}")
+        if reasoning_tokens:
+            print(f"  ↳ Reasoning (subset):      {reasoning_tokens:>10,}")
         print(f"  Prompt tokens (total):     {prompt:>10,}")
         print(f"  Completion tokens:         {completion:>10,}")
         print(f"  Total tokens:              {total:>10,}")
@@ -9096,6 +9208,27 @@ class HermesCLI:
             choices.append("view")
         return choices
 
+    def _computer_use_approval_callback(self, action: str, args: dict, summary: str) -> str:
+        """Adapt the generic approval UI for the computer_use tool.
+
+        The computer_use handler expects verdicts of the form
+        `approve_once` | `approve_session` | `always_approve` | `deny`.
+        The CLI's built-in approval UI returns `once` | `session` | `always`
+        | `deny`. Translate between the two.
+        """
+        # Build a command-ish string so the existing UI renders something
+        # meaningful. `summary` is already a one-line human description.
+        verdict = self._approval_callback(
+            command=f"computer_use: {summary}",
+            description=f"Allow computer_use to perform `{action}`?",
+        )
+        return {
+            "once": "approve_once",
+            "session": "approve_session",
+            "always": "always_approve",
+            "deny": "deny",
+        }.get(verdict, "deny")
+
     def _handle_approval_selection(self) -> None:
         """Process the currently selected dangerous-command approval choice."""
         state = self._approval_state
@@ -9356,6 +9489,12 @@ class HermesCLI:
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
+
+        # Reset the per-turn interrupt flag. Any subsequent path that
+        # discovers an interrupt (below, after run_conversation) will flip
+        # this to True. Early returns (credential refresh failure, etc.)
+        # leave it False, which is correct — those aren't user interrupts.
+        self._last_turn_interrupted = False
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -9780,7 +9919,11 @@ class HermesCLI:
 
             # Handle interrupt - check if we were interrupted
             pending_message = None
-            if result and result.get("interrupted"):
+            _interrupted_this_turn = bool(result and result.get("interrupted"))
+            # Expose the flag for post-turn hooks (e.g. goal continuation)
+            # so they can skip themselves when the turn was user-cancelled.
+            self._last_turn_interrupted = _interrupted_this_turn
+            if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
                 # Add indicator that we were interrupted
                 if response and pending_message:
@@ -10180,6 +10323,24 @@ class HermesCLI:
             _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
             _welcome_color = "#FFF8DC"
         self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
+
+        # Redaction opt-out warning (#17691): ON by default, loud when off.
+        # The redactor snapshots its state at import time so any toggle now
+        # won't affect the running process — we just want the operator to
+        # see that they're running without the safety net.
+        try:
+            _redact_raw = os.getenv("HERMES_REDACT_SECRETS", "true")
+            if _redact_raw.lower() not in ("1", "true", "yes", "on"):
+                self._console_print(
+                    "[bold red]⚠  Secret redaction is DISABLED[/] "
+                    f"(HERMES_REDACT_SECRETS={_redact_raw}). "
+                    "API keys and tokens may appear verbatim in chat output, "
+                    "session JSONs, and logs. Set "
+                    "[cyan]security.redact_secrets: true[/] in config.yaml "
+                    "to re-enable."
+                )
+        except Exception:
+            pass
         # First-time OpenClaw-residue banner — fires once if ~/.openclaw/ exists
         # after an OpenClaw→Hermes migration (especially migrations done by
         # OpenClaw's own tool, which doesn't archive the source directory).
@@ -10242,6 +10403,9 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        # See constructor note. Mirrored here for the run() path that skips
+        # the earlier __init__ branch.
+        self._last_turn_interrupted = False
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
 
@@ -10301,6 +10465,16 @@ class HermesCLI:
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
 
+        # Computer-use shares the same approval UI (prompt_toolkit dialog).
+        # The tool handler expects a 3-arg callback (action, args, summary)
+        # and returns "approve_once" | "approve_session" | "always_approve"
+        # | "deny". Adapt our existing generic callback.
+        try:
+            from tools.computer_use_tool import set_approval_callback as _set_cu_cb
+            _set_cu_cb(self._computer_use_approval_callback)
+        except ImportError:
+            pass  # computer_use extras not installed
+
         # Ensure tirith security scanner is available (downloads if needed).
         # Warn the user if tirith is enabled in config but not available,
         # so they know command security scanning is degraded.
@@ -10319,7 +10493,6 @@ class HermesCLI:
         # Key bindings for the input area
         kb = KeyBindings()
         
-        @kb.add('enter')
         def handle_enter(event):
             """Handle Enter key - submit input.
             
@@ -10357,7 +10530,11 @@ class HermesCLI:
 
             # --- /model picker modal ---
             if self._model_picker_state:
-                self._handle_model_picker_selection()
+                try:
+                    self._handle_model_picker_selection()
+                except Exception as _exc:
+                    _cprint(f"  ✗ Model selection failed: {_exc}")
+                    self._close_model_picker()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
@@ -10478,15 +10655,12 @@ class HermesCLI:
                 else:
                     self._pending_input.put(payload)
                 event.app.current_buffer.reset(append_to_history=True)
+
+        _bind_prompt_submit_keys(kb, handle_enter)
         
         @kb.add('escape', 'enter')
         def handle_alt_enter(event):
             """Alt+Enter inserts a newline for multi-line input."""
-            event.current_buffer.insert_text('\n')
-
-        @kb.add('c-j')
-        def handle_ctrl_enter(event):
-            """Ctrl+Enter (c-j) inserts a newline. Most terminals send c-j for Ctrl+Enter."""
             event.current_buffer.insert_text('\n')
 
         # VSCode/Cursor bind Ctrl+G to "Find Next" at the editor level, so
@@ -11087,7 +11261,7 @@ class HermesCLI:
         def get_prompt():
             return cli_ref._get_tui_prompt_fragments()
 
-        # Create the input area with multiline (shift+enter), autocomplete, and paste handling
+        # Create the input area with multiline (Alt+Enter), autocomplete, and paste handling
         from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 
 
@@ -11829,6 +12003,7 @@ class HermesCLI:
             mouse_support=False,
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
+        _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
 
         # ── Fix ghost status-bar lines on terminal resize ──────────────
@@ -12115,8 +12290,12 @@ class HermesCLI:
                 # Set the custom handler on prompt_toolkit's event loop
                 try:
                     import asyncio as _aio
-                    _loop = _aio.get_event_loop()
+                    # Use get_running_loop() to avoid DeprecationWarning on
+                    # Python 3.10+ when called outside an async context.
+                    _loop = _aio.get_running_loop()
                     _loop.set_exception_handler(_suppress_closed_loop_errors)
+                except RuntimeError:
+                    pass  # No running loop -- nothing to patch
                 except Exception:
                     pass
                 app.run()
@@ -12451,7 +12630,18 @@ def main(
                     ):
                         cli.session_id = cli.agent.session_id
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
-                    if response:
+                    # Surface backend errors that produced no visible output
+                    # (e.g. invalid model slug → provider 4xx). Mirrors the
+                    # interactive CLI path. Write to stderr so piped stdout
+                    # stays clean for automation wrappers.
+                    if (
+                        not response
+                        and isinstance(result, dict)
+                        and result.get("error")
+                        and (result.get("failed") or result.get("partial"))
+                    ):
+                        print(f"Error: {result['error']}", file=sys.stderr)
+                    elif response:
                         print(response)
                     # Session ID goes to stderr so piped stdout is clean.
                     print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
