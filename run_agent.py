@@ -7710,7 +7710,7 @@ class AIAgent:
                         usage_obj = chunk.usage
                     continue
 
-                delta = chunk.choices[0].delta
+                delta = getattr(chunk.choices[0], "delta", None)
                 if hasattr(chunk, "model") and chunk.model:
                     model_name = chunk.model
 
@@ -7722,11 +7722,12 @@ class AIAgent:
                     self._fire_reasoning_delta(reasoning_text)
 
                 # Accumulate text content — fire callback only when no tool calls
-                if delta and delta.content:
-                    content_parts.append(delta.content)
+                delta_content = getattr(delta, "content", None)
+                if delta and delta_content:
+                    content_parts.append(delta_content)
                     if not tool_calls_acc:
                         _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
+                        self._fire_stream_delta(delta_content)
                         deltas_were_sent["yes"] = True
                     else:
                         # Tool calls suppress regular content streaming (avoids
@@ -7742,16 +7743,18 @@ class AIAgent:
                         # box is already closed (tool boundary flush).
                         if self.stream_delta_callback:
                             try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
+                                self.stream_delta_callback(delta_content)
+                                self._record_streamed_assistant_text(delta_content)
                             except Exception:
                                 pass
 
                 # Accumulate tool call deltas — notify display on first name
-                if delta and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        raw_idx = tc_delta.index if tc_delta.index is not None else 0
-                        delta_id = tc_delta.id or ""
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta and delta_tool_calls:
+                    for tc_delta in delta_tool_calls:
+                        raw_idx_value = getattr(tc_delta, "index", None)
+                        raw_idx = raw_idx_value if raw_idx_value is not None else 0
+                        delta_id = getattr(tc_delta, "id", None) or ""
 
                         # Ollama fix: detect a new tool call reusing the same
                         # raw index (different id) and redirect to a fresh slot.
@@ -7770,16 +7773,20 @@ class AIAgent:
 
                         if idx not in tool_calls_acc:
                             tool_calls_acc[idx] = {
-                                "id": tc_delta.id or "",
+                                "id": getattr(tc_delta, "id", None) or "",
                                 "type": "function",
                                 "function": {"name": "", "arguments": ""},
                                 "extra_content": None,
                             }
                         entry = tool_calls_acc[idx]
-                        if tc_delta.id:
-                            entry["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
+                        tc_id = getattr(tc_delta, "id", None)
+                        if tc_id:
+                            entry["id"] = tc_id
+                        tc_function = getattr(tc_delta, "function", None)
+                        if tc_function:
+                            function_name = getattr(tc_function, "name", None)
+                            function_arguments = getattr(tc_function, "arguments", None)
+                            if function_name:
                                 # Use assignment, not +=.  Function names are
                                 # atomic identifiers delivered complete in the
                                 # first chunk (OpenAI spec).  Some providers
@@ -7788,9 +7795,9 @@ class AIAgent:
                                 # produce "read_fileread_file".  Assignment
                                 # (matching the OpenAI Node SDK / LiteLLM /
                                 # Vercel AI patterns) is immune to this.
-                                entry["function"]["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                entry["function"]["arguments"] += tc_delta.function.arguments
+                                entry["function"]["name"] = function_name
+                            if function_arguments:
+                                entry["function"]["arguments"] += function_arguments
                         extra = getattr(tc_delta, "extra_content", None)
                         if extra is None and hasattr(tc_delta, "model_extra"):
                             extra = (tc_delta.model_extra or {}).get("extra_content")

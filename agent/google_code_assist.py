@@ -37,6 +37,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+
+class _CodeAssistResponseShim:
+    """Minimal response object exposing headers/text/json for error handlers."""
+
+    def __init__(self, *, status_code: int, text: str, headers: Any = None) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(self.text or "{}")
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
 logger = logging.getLogger(__name__)
 
 
@@ -165,19 +181,122 @@ def _post_json(
             pass
         # Special case: VPC-SC violation should be distinguishable
         if _is_vpc_sc_violation(detail):
+            response = _CodeAssistResponseShim(status_code=exc.code, text=detail, headers=exc.headers)
             raise CodeAssistError(
                 f"VPC-SC policy violation: {detail}",
                 code="code_assist_vpc_sc",
+                status_code=exc.code,
+                response=response,
+                details=_parse_google_error_envelope(detail),
             ) from exc
-        raise CodeAssistError(
-            f"Code Assist HTTP {exc.code}: {detail or exc.reason}",
-            code=f"code_assist_http_{exc.code}",
-        ) from exc
+        raise _code_assist_http_error(exc, detail) from exc
     except urllib.error.URLError as exc:
         raise CodeAssistError(
             f"Code Assist request failed: {exc}",
             code="code_assist_network_error",
         ) from exc
+
+
+def _parse_retry_delay(details: List[Any], headers: Any = None) -> Optional[float]:
+    """Extract retry delay seconds from google.rpc.RetryInfo or Retry-After."""
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        type_url = str(detail.get("@type") or "")
+        if not type_url.endswith("/google.rpc.RetryInfo"):
+            continue
+        delay_raw = detail.get("retryDelay")
+        if isinstance(delay_raw, str) and delay_raw.endswith("s"):
+            try:
+                return float(delay_raw[:-1])
+            except ValueError:
+                pass
+        elif isinstance(delay_raw, (int, float)):
+            return float(delay_raw)
+    if headers is not None:
+        try:
+            header_val = headers.get("Retry-After") or headers.get("retry-after")
+        except Exception:
+            header_val = None
+        if header_val:
+            try:
+                return float(header_val)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _parse_google_error_envelope(body_text: str) -> Dict[str, Any]:
+    """Return parsed Google error fields from a JSON error envelope."""
+    try:
+        parsed = json.loads(body_text or "{}")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        parsed = {}
+    err_obj = parsed.get("error") if isinstance(parsed, dict) else None
+    if not isinstance(err_obj, dict):
+        err_obj = {}
+    details_raw = err_obj.get("details")
+    details = details_raw if isinstance(details_raw, list) else []
+    reason = ""
+    metadata: Dict[str, Any] = {}
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        type_url = str(detail.get("@type") or "")
+        if type_url.endswith("/google.rpc.ErrorInfo"):
+            maybe_reason = detail.get("reason")
+            if isinstance(maybe_reason, str) and maybe_reason and not reason:
+                reason = maybe_reason
+            md = detail.get("metadata")
+            if isinstance(md, dict) and not metadata:
+                metadata = md
+    return {
+        "status": str(err_obj.get("status") or "").strip(),
+        "message": str(err_obj.get("message") or "").strip(),
+        "reason": reason,
+        "metadata": metadata,
+        "details": details,
+    }
+
+
+def _code_assist_http_error(exc: urllib.error.HTTPError, body_text: str) -> CodeAssistError:
+    """Build a structured CodeAssistError from a control-plane HTTPError."""
+    parsed = _parse_google_error_envelope(body_text)
+    retry_after = _parse_retry_delay(parsed.get("details") or [], exc.headers)
+    response = _CodeAssistResponseShim(status_code=exc.code, text=body_text, headers=exc.headers)
+    code = f"code_assist_http_{exc.code}"
+    if exc.code == 401:
+        code = "code_assist_unauthorized"
+    elif exc.code == 429:
+        code = "code_assist_rate_limited"
+        if parsed.get("reason") == "MODEL_CAPACITY_EXHAUSTED":
+            code = "code_assist_capacity_exhausted"
+
+    message_text = parsed.get("message") or body_text or str(exc.reason)
+    if exc.code == 429 and parsed.get("status") == "RESOURCE_EXHAUSTED":
+        message = (
+            f"Code Assist quota/capacity exhausted ({message_text}). "
+            "/gquota shows daily buckets only; hidden RPM/TPM, web-search, "
+            "account, and model-capacity limits may still apply."
+        )
+        if retry_after is not None:
+            message += f" Retry suggested in {retry_after:g}s."
+    else:
+        message = f"Code Assist HTTP {exc.code}: {message_text}"
+
+    return CodeAssistError(
+        message,
+        code=code,
+        status_code=exc.code,
+        response=response,
+        retry_after=retry_after,
+        details={
+            "status": parsed.get("status"),
+            "reason": parsed.get("reason"),
+            "metadata": parsed.get("metadata"),
+            "message": parsed.get("message"),
+        },
+    )
 
 
 def _is_vpc_sc_violation(body: str) -> bool:

@@ -1196,3 +1196,119 @@ class TestRunGeminiOauthLoginPure:
         assert result["email"] == "u@e.com"
         assert result["project_id"] == "p"
         assert isinstance(result["expires_at_ms"], int)
+
+
+class TestStreamChunkShapeRegression:
+    def test_finish_only_stream_chunk_has_nullable_openai_delta_fields(self):
+        from agent.gemini_cloudcode_adapter import _translate_stream_event
+
+        chunks = _translate_stream_event(
+            {"response": {"candidates": [{"finishReason": "STOP"}]}},
+            model="gemini-3.1-pro-preview",
+            tool_call_counter=[0],
+        )
+
+        delta = chunks[-1].choices[0].delta
+        assert delta.content is None
+        assert delta.tool_calls is None
+        assert delta.reasoning is None
+        assert delta.reasoning_content is None
+
+    def test_reasoning_only_stream_chunk_has_content_and_tool_call_attrs(self):
+        from agent.gemini_cloudcode_adapter import _translate_stream_event
+
+        chunks = _translate_stream_event(
+            {"response": {"candidates": [{
+                "content": {"parts": [{"thought": True, "text": "thinking"}]},
+            }]}},
+            model="gemini-3-flash-preview",
+            tool_call_counter=[0],
+        )
+
+        delta = chunks[0].choices[0].delta
+        assert delta.content is None
+        assert delta.tool_calls is None
+        assert delta.reasoning == "thinking"
+        assert delta.reasoning_content == "thinking"
+
+
+class TestCodeAssistControlPlaneHttpErrors:
+    def test_http_error_preserves_429_retry_and_details(self):
+        import urllib.error
+        from email.message import Message
+        from agent.google_code_assist import _code_assist_http_error
+
+        headers = Message()
+        headers["Retry-After"] = "17"
+        body = json.dumps({
+            "error": {
+                "code": 429,
+                "message": "Quota exceeded for requests per minute.",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "RATE_LIMIT_EXCEEDED",
+                    "metadata": {"quota_limit": "rpm"},
+                }],
+            }
+        })
+        exc = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+            429,
+            "Too Many Requests",
+            headers,
+            None,
+        )
+
+        err = _code_assist_http_error(exc, body)
+
+        assert err.status_code == 429
+        assert err.code == "code_assist_rate_limited"
+        assert err.retry_after == 17.0
+        assert err.response.headers is headers
+        assert err.details["status"] == "RESOURCE_EXHAUSTED"
+        assert err.details["reason"] == "RATE_LIMIT_EXCEEDED"
+        assert "daily buckets only" in str(err)
+
+
+class TestGquotaProjectResolution:
+    def test_gquota_resolves_project_before_quota_lookup(self, monkeypatch):
+        from cli import HermesCLI
+        from agent import google_oauth, google_code_assist
+        from agent.google_code_assist import ProjectContext, QuotaBucket
+
+        calls = {}
+        monkeypatch.setattr(google_oauth, "get_valid_access_token", lambda: "access-token")
+        monkeypatch.setattr(
+            google_oauth,
+            "load_credentials",
+            lambda: SimpleNamespace(project_id="", managed_project_id=""),
+        )
+        monkeypatch.setattr(google_oauth, "resolve_project_id_from_env", lambda: "")
+        monkeypatch.setattr(
+            google_oauth,
+            "update_project_ids",
+            lambda **kw: calls.setdefault("updated", kw),
+        )
+
+        def fake_resolve(access_token, **kwargs):
+            calls["resolve"] = (access_token, kwargs)
+            return ProjectContext(project_id="resolved-proj", managed_project_id="managed-proj", source="discovered")
+
+        def fake_quota(access_token, *, project_id="", **kwargs):
+            calls["quota"] = (access_token, project_id, kwargs)
+            return [QuotaBucket(model_id="gemini-3.1-pro-preview", token_type="", remaining_fraction=0.5)]
+
+        monkeypatch.setattr(google_code_assist, "resolve_project_context", fake_resolve)
+        monkeypatch.setattr(google_code_assist, "retrieve_user_quota", fake_quota)
+
+        cli = HermesCLI.__new__(HermesCLI)
+        cli.current_model = "gemini-3.1-pro-preview"
+        printed = []
+        cli._console_print = lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args))
+
+        cli._handle_gquota_command("/gquota")
+
+        assert calls["quota"][1] == "resolved-proj"
+        assert calls["updated"] == {"project_id": "resolved-proj", "managed_project_id": "managed-proj"}
+        assert any("daily Code Assist buckets only" in line for line in printed)
