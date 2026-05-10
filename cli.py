@@ -6330,7 +6330,7 @@ class HermesCLI:
                 ctx = resolve_project_context(
                     access_token,
                     env_project_id=google_oauth.resolve_project_id_from_env(),
-                    user_agent_model=str(self.current_model or ""),
+                    user_agent_model=str(getattr(self, "current_model", "") or ""),
                 )
                 project_id = ctx.project_id or ""
                 project_source = ctx.source or project_source
