@@ -3749,6 +3749,35 @@ def _rotate_worker_log(log_path: Path, max_bytes: int) -> None:
         pass
 
 
+def _resolve_hermes_argv() -> list[str]:
+    """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
+
+    Tries in order:
+
+    1. ``shutil.which("hermes")`` — the console-script shim, the same form
+       that shows up in ``ps`` output and existing logs. Preferred so live
+       systems' diagnostics stay familiar.
+    2. ``sys.executable -m hermes_cli.main`` — fallback for setups where
+       Hermes is launched from a venv and the ``hermes`` shim is not on
+       the dispatcher's ``$PATH`` (cron, systemd ``User=`` services,
+       launchd jobs, detached processes, etc.). Goes through the running
+       interpreter so the result is independent of ``$PATH``.
+
+    Mirrors ``gateway.run._resolve_hermes_bin`` for the same reason. Kept
+    local (not imported from gateway) because ``hermes_cli`` sits below
+    ``gateway`` in the dependency order.
+    """
+    import shutil
+
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin]
+    # Fallback to the module form. ``hermes_cli.main`` is the actual
+    # console-script target declared in pyproject.toml, NOT a top-level
+    # ``hermes`` package — there is no ``hermes`` package to import.
+    return [sys.executable, "-m", "hermes_cli.main"]
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -3805,7 +3834,7 @@ def _default_spawn(
     env["HERMES_PROFILE"] = profile_arg
 
     cmd = [
-        "hermes",
+        *_resolve_hermes_argv(),
         "-p", profile_arg,
         # Auto-load the kanban-worker skill so every dispatched worker
         # has the pattern library (good summary/metadata shapes, retry
@@ -4161,16 +4190,26 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _safe_int(val: Optional[str]) -> Optional[int]:
+    """Parse a timestamp field to int, returning None on garbage like '%s'."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
-    age_since_created = now - int(task.created_at) if task.created_at else None
-    age_since_started = (
-        now - int(task.started_at) if task.started_at else None
-    )
+    created = _safe_int(task.created_at)
+    started = _safe_int(task.started_at)
+    completed = _safe_int(task.completed_at)
+    age_since_created = now - created if created else None
+    age_since_started = now - started if started else None
     time_to_complete = (
-        int(task.completed_at) - int(task.started_at or task.created_at)
-        if task.completed_at else None
+        completed - (started or created) if completed else None
     )
     return {
         "created_age_seconds": age_since_created,
