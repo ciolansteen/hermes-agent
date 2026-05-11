@@ -1249,6 +1249,7 @@ class GatewayRunner:
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -4071,6 +4072,14 @@ class GatewayRunner:
                     break
                 await asyncio.sleep(1)
 
+    def _active_profile_name(self) -> str:
+        """Return the profile name this gateway represents."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -4119,6 +4128,10 @@ class GatewayRunner:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            notifier_profile = self._active_profile_name()
+            self._kanban_notifier_profile = notifier_profile
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -4181,6 +4194,13 @@ class GatewayRunner:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
+                                owner_profile = sub.get("notifier_profile") or None
+                                if owner_profile and owner_profile != notifier_profile:
+                                    logger.debug(
+                                        "kanban notifier: subscription for %s owned by profile %s; current profile %s skipping",
+                                        sub.get("task_id"), owner_profile, notifier_profile,
+                                    )
+                                    continue
                                 platform = (sub.get("platform") or "").lower()
                                 if platform not in active_platforms:
                                     logger.debug(
@@ -6063,6 +6083,12 @@ class GatewayRunner:
                     return await self._handle_goal_command(event)
                 return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
 
+            # /subgoal is safe mid-run — it only modifies the active goal's
+            # checklist, which the judge consults at turn boundaries. There
+            # is no race with the running turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
+                return await self._handle_subgoal_command(event)
+
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
             # the tool-progress display mode for the ongoing stream.
@@ -6190,10 +6216,9 @@ class GatewayRunner:
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
             running_agent.interrupt(event.text)
-            if _quick_key in self._pending_messages:
-                self._pending_messages[_quick_key] += "\n" + event.text
-            else:
-                self._pending_messages[_quick_key] = event.text
+            # NOTE: self._pending_messages was write-only (never consumed).
+            # The actual interrupt message is delivered via adapter._pending_messages
+            # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
         # Check for commands
@@ -6442,6 +6467,9 @@ class GatewayRunner:
         if canonical == "goal":
             return await self._handle_goal_command(event)
 
+        if canonical == "subgoal":
+            return await self._handle_subgoal_command(event)
+
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
@@ -6462,13 +6490,23 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            # Sanitize env to prevent credential leakage —
+                            # quick commands run in the gateway process which
+                            # has all API keys in os.environ.
+                            from tools.environments.local import _sanitize_subprocess_env
+                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.PIPE,
+                                env=sanitized_env,
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
+                            # Redact any remaining sensitive patterns in output
+                            if output:
+                                from agent.redact import redact_sensitive_text
+                                output = redact_sensitive_text(output)
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
@@ -6616,10 +6654,18 @@ class GatewayRunner:
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
+                        # Pull the agent's full messages list from the result
+                        # so the judge can dump it for its read_file tool.
+                        _agent_messages: list = []
+                        if isinstance(_agent_result, dict):
+                            _msgs = _agent_result.get("messages")
+                            if isinstance(_msgs, list):
+                                _agent_messages = _msgs
                         await self._post_turn_goal_continuation(
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            agent_messages=_agent_messages,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -7025,7 +7071,7 @@ class GatewayRunner:
                             pass
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=getattr(event, 'metadata', None),
+                            metadata=self._thread_metadata_for_source(source),
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -8326,6 +8372,7 @@ class GatewayRunner:
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
                                 )
                             finally:
                                 conn.close()
@@ -9335,6 +9382,83 @@ class GatewayRunner:
 
         return t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
 
+    async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
+        """Handle /subgoal for gateway platforms.
+
+        Forms (mirror of CLI):
+          /subgoal                              show the checklist
+          /subgoal <text>                       append a user item
+          /subgoal complete <n> | done <n>      mark item n completed
+          /subgoal impossible <n>               mark item n impossible
+          /subgoal undo <n>                     revert item n to pending
+          /subgoal remove <n>                   delete item n
+          /subgoal clear                        wipe the checklist
+        """
+        args = (event.get_command_args() or "").strip()
+
+        mgr, _session_entry = self._get_goal_manager_for_event(event)
+        if mgr is None:
+            return t("gateway.goal.unavailable")
+
+        if not mgr.has_goal():
+            return "No active goal. Set one with /goal <text>."
+
+        if not args:
+            return f"{mgr.status_line()}\n{mgr.render_checklist()}"
+
+        tokens = args.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        action_status_map = {
+            "complete": "completed",
+            "completed": "completed",
+            "done": "completed",
+            "impossible": "impossible",
+            "imp": "impossible",
+            "skip": "impossible",
+            "undo": "pending",
+            "pending": "pending",
+            "reset": "pending",
+        }
+        if verb in action_status_map:
+            if not rest:
+                return f"Usage: /subgoal {verb} <n>"
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                return f"/subgoal {verb}: <n> must be an integer (1-based index)."
+            try:
+                item = mgr.mark_subgoal(idx, action_status_map[verb])
+            except (IndexError, ValueError, RuntimeError) as exc:
+                return f"/subgoal {verb}: {exc}"
+            return f"✓ Item {idx} → {item.status}: {item.text}"
+
+        if verb == "remove":
+            if not rest:
+                return "Usage: /subgoal remove <n>"
+            try:
+                idx = int(rest.split()[0])
+            except ValueError:
+                return "/subgoal remove: <n> must be an integer (1-based index)."
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                return f"/subgoal remove: {exc}"
+            return f"✓ Removed item {idx}: {removed.text}"
+
+        if verb == "clear":
+            mgr.clear_checklist()
+            return "✓ Checklist cleared. The judge will re-decompose on the next turn."
+
+        # Otherwise — append `args` as a new user-authored checklist item.
+        try:
+            item = mgr.add_subgoal(args)
+        except (ValueError, RuntimeError) as exc:
+            return f"/subgoal: {exc}"
+        idx = len(mgr.state.checklist) if mgr.state else 0
+        return f"✓ Added subgoal {idx}: {item.text}"
+
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self.adapters.get(source.platform)
@@ -9403,6 +9527,7 @@ class GatewayRunner:
         session_entry: Any,
         source: Any,
         final_response: str,
+        agent_messages: Optional[list] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -9430,7 +9555,11 @@ class GatewayRunner:
         if not mgr.is_active():
             return
 
-        decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        decision = mgr.evaluate_after_turn(
+            final_response or "",
+            user_initiated=True,
+            messages=agent_messages or [],
+        )
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -13885,6 +14014,8 @@ class GatewayRunner:
                         cursor=_effective_cursor,
                         buffer_only=_buffer_only,
                         fresh_final_after_seconds=_fresh_final_secs,
+                        transport=_scfg.transport or "auto",
+                        chat_type=getattr(source, "chat_type", "") or "",
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -14706,6 +14837,8 @@ class GatewayRunner:
                             cursor=_effective_cursor,
                             buffer_only=_buffer_only,
                             fresh_final_after_seconds=_fresh_final_secs,
+                            transport=_scfg.transport or "auto",
+                            chat_type=getattr(source, "chat_type", "") or "",
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
