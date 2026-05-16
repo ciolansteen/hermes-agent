@@ -25,11 +25,21 @@ jobs:
           submodules: recursive
 
       - name: Login to Gitea registry
+        env:
+          SECRET_REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          SECRET_REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          SECRET_CI_TOKEN: ${{ secrets.CI_TOKEN }}
         run: |
           set -euo pipefail
-          echo "${{ secrets.REGISTRY_TOKEN }}" \
+          registry_user="${SECRET_REGISTRY_USER:-${IMAGE_OWNER}}"
+          registry_token="${SECRET_REGISTRY_TOKEN:-${SECRET_CI_TOKEN:-}}"
+          if [ -z "$registry_token" ]; then
+            echo "ERROR: missing REGISTRY_TOKEN or CI_TOKEN secret for registry login" >&2
+            exit 1
+          fi
+          echo "$registry_token" \
             | docker login "${REGISTRY}" \
-                -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+                -u "$registry_user" --password-stdin
 
       - name: Build and push image
         run: |
@@ -51,13 +61,19 @@ jobs:
 
       - name: Link Docker package to repository
         env:
-          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          SECRET_REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          SECRET_CI_TOKEN: ${{ secrets.CI_TOKEN }}
           GITEA_API_URL: ${{ github.server_url }}/api/v1
         run: |
           set -euo pipefail
+          gitea_token="${SECRET_REGISTRY_TOKEN:-${SECRET_CI_TOKEN:-}}"
+          if [ -z "$gitea_token" ]; then
+            echo "ERROR: missing REGISTRY_TOKEN or CI_TOKEN secret for package API" >&2
+            exit 1
+          fi
           http=$(curl -sS -o /tmp/package-link.out -w "%{http_code}" \
             -X POST \
-            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H "Authorization: token ${gitea_token}" \
             "${GITEA_API_URL}/packages/${IMAGE_OWNER}/${PACKAGE_TYPE}/${IMAGE_NAME}/-/link/${IMAGE_NAME}")
           case "$http" in
             200|201|202|204|409)
@@ -72,11 +88,17 @@ jobs:
 
       - name: Prune old Docker package versions
         env:
-          GITEA_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          SECRET_REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          SECRET_CI_TOKEN: ${{ secrets.CI_TOKEN }}
           GITEA_API_URL: ${{ github.server_url }}/api/v1
           CURRENT_SHA: ${{ gitea.sha }}
         run: |
           set -euo pipefail
+          export GITEA_TOKEN="${SECRET_REGISTRY_TOKEN:-${SECRET_CI_TOKEN:-}}"
+          if [ -z "$GITEA_TOKEN" ]; then
+            echo "ERROR: missing REGISTRY_TOKEN or CI_TOKEN secret for package API" >&2
+            exit 1
+          fi
           python3 - <<'PY'
           import json
           import os
