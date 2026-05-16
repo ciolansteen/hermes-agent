@@ -1,0 +1,12 @@
+# This file intentionally overrides .github/workflows/nix.yml on Gitea.
+# Nix builds run on GitHub Actions (NousResearch CI) — not here.
+name: Nix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  skip:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "Nix CI runs on GitHub Actions only — skipping on Gitea."
