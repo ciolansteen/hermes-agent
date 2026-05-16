@@ -55,9 +55,24 @@ jobs:
             -t "${image}:latest" \
             .
 
-          docker push "${image}:${sha_tag}"
-          docker push "${image}:${short_sha}"
-          docker push "${image}:latest"
+          docker_push_with_heartbeat() {
+            local image="$1"
+            local log=/tmp/docker-push.log
+            rm -f "$log"
+            docker push --all-tags "$image" >"$log" 2>&1 &
+            local pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+              echo "[push heartbeat] docker push still running for ${image} at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              tail -20 "$log" || true
+              sleep 60
+            done
+            wait "$pid"
+            local rc=$?
+            cat "$log" || true
+            return "$rc"
+          }
+
+          docker_push_with_heartbeat "${image}"
           echo "[OK] pushed ${image}:${sha_tag}, ${image}:${short_sha}, ${image}:latest"
 
       - name: Link Docker package to repository
