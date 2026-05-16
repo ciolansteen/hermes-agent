@@ -393,6 +393,19 @@ def _is_destructive_command(cmd: str) -> bool:
     return False
 
 
+def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
+    """Check if an MCP tool comes from a server with parallel tool calls enabled.
+
+    Lazy-imports from ``tools.mcp_tool`` to avoid circular dependencies.
+    Returns False if the MCP module is not available.
+    """
+    try:
+        from tools.mcp_tool import is_mcp_tool_parallel_safe
+        return is_mcp_tool_parallel_safe(tool_name)
+    except Exception:
+        return False
+
+
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when a tool-call batch is safe to run concurrently."""
     if len(tool_calls) <= 1:
@@ -432,7 +445,9 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             continue
 
         if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
+            # Check if it's an MCP tool from a server that opted into parallel calls.
+            if not _is_mcp_tool_parallel_safe(tool_name):
+                return False
 
     return True
 
@@ -3027,6 +3042,24 @@ class AIAgent:
             parts.append(f"{type(e).__name__}({msg})" if msg else type(e).__name__)
         return " <- ".join(parts) if parts else type(error).__name__
 
+    def _is_provider_stream_parse_error(self, error: BaseException) -> bool:
+        """Return True for malformed provider streaming data from SDK parsers.
+
+        Some Anthropic-compatible streaming providers can send a malformed
+        event-stream frame.  The Anthropic SDK surfaces that as a plain
+        ``ValueError`` such as ``expected ident at line 1 column 149``.  That
+        is provider wire-format trouble, not local request validation, so it
+        should follow the same retry path as a truncated JSON body.
+        """
+        if getattr(self, "api_mode", None) != "anthropic_messages":
+            return False
+        if not isinstance(error, ValueError):
+            return False
+        if isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
+            return False
+        message = str(error).strip().lower()
+        return "expected ident at line" in message
+
     def _log_stream_retry(
         self,
         *,
@@ -3237,11 +3270,20 @@ class AIAgent:
             except Exception:
                 _aux_cfg_provider = ""
             if client is None or not aux_model:
-                msg = (
-                    "⚠ No auxiliary LLM provider configured — context "
-                    "compression will drop middle turns without a summary. "
-                    "Run `hermes setup` or set OPENROUTER_API_KEY."
-                )
+                if _aux_cfg_provider and _aux_cfg_provider != "auto":
+                    msg = (
+                        "⚠ Configured auxiliary compression provider "
+                        f"'{_aux_cfg_provider}' is unavailable — context "
+                        "compression will drop middle turns without a summary. "
+                        "Check auxiliary.compression in config.yaml and "
+                        "reauthenticate that provider."
+                    )
+                else:
+                    msg = (
+                        "⚠ No auxiliary LLM provider configured — context "
+                        "compression will drop middle turns without a summary. "
+                        "Run `hermes setup` or set OPENROUTER_API_KEY."
+                    )
                 self._compression_warning = msg
                 self._emit_status(msg)
                 logger.warning(
@@ -5070,6 +5112,12 @@ class AIAgent:
         str(error) for everything else.
         """
         raw = str(error)
+
+        if (
+            isinstance(error, ValueError)
+            and "expected ident at line" in raw.lower()
+        ):
+            return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -8526,6 +8574,7 @@ class AIAgent:
                         _is_conn_err = isinstance(
                             e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                         )
+                        _is_stream_parse_err = self._is_provider_stream_parse_error(e)
 
                         # If the stream died AFTER some tokens were delivered:
                         # normally we don't retry (the user already saw text,
@@ -8565,7 +8614,10 @@ class AIAgent:
                                         for phrase in _SSE_PREVIEW_PHRASES
                                     )
                             _is_transient = (
-                                _is_timeout or _is_conn_err or _is_sse_conn_err_preview
+                                _is_timeout
+                                or _is_conn_err
+                                or _is_sse_conn_err_preview
+                                or _is_stream_parse_err
                             )
                             _can_silent_retry = (
                                 _partial_tool_in_flight
@@ -8663,7 +8715,7 @@ class AIAgent:
                                     for phrase in _SSE_CONN_PHRASES
                                 )
 
-                        if _is_timeout or _is_conn_err or _is_sse_conn_err:
+                        if _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err:
                             # Transient network / timeout error. Retry the
                             # streaming request with a fresh connection first.
                             if _stream_attempt < _max_stream_retries:
@@ -8704,12 +8756,20 @@ class AIAgent:
                                 mid_tool_call=False,
                                 diag=request_client_holder.get("diag"),
                             )
-                            self._emit_status(
-                                "❌ Connection to provider failed after "
-                                f"{_max_stream_retries + 1} attempts. "
-                                "The provider may be experiencing issues — "
-                                "try again in a moment."
-                            )
+                            if _is_stream_parse_err:
+                                self._emit_status(
+                                    "❌ Provider returned malformed streaming data after "
+                                    f"{_max_stream_retries + 1} attempts. "
+                                    "The provider may be experiencing issues — "
+                                    "try again in a moment."
+                                )
+                            else:
+                                self._emit_status(
+                                    "❌ Connection to provider failed after "
+                                    f"{_max_stream_retries + 1} attempts. "
+                                    "The provider may be experiencing issues — "
+                                    "try again in a moment."
+                                )
                         else:
                             _err_lower = str(e).lower()
                             _is_stream_unsupported = (
@@ -14507,11 +14567,16 @@ class AIAgent:
                     # provider/network failure (malformed response body,
                     # truncated stream, routing layer corruption), not a
                     # local programming bug, and should be retried (#14782).
+                    # Exclude Anthropic stream parser ValueErrors for the
+                    # same reason: third-party Anthropic-compatible providers
+                    # can emit malformed event-stream frames that SDK parsers
+                    # raise as plain ValueError.
                     is_local_validation_error = (
                         isinstance(api_error, (ValueError, TypeError))
                         and not isinstance(
                             api_error, (UnicodeEncodeError, json.JSONDecodeError)
                         )
+                        and not self._is_provider_stream_parse_error(api_error)
                         # ssl.SSLError (and its subclass SSLCertVerificationError)
                         # inherits from OSError *and* ValueError via Python MRO,
                         # so the isinstance(ValueError) check above would
