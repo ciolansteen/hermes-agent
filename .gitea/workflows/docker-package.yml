@@ -95,6 +95,10 @@ jobs:
             200|201|202|204|409)
               echo "Package link accepted/already present (HTTP $http)."
               ;;
+            403)
+              echo "WARNING: package link is not permitted by this Gitea API/token (HTTP 403); package push succeeded, continuing."
+              cat /tmp/package-link.out >&2 || true
+              ;;
             *)
               echo "ERROR: package link failed with HTTP $http" >&2
               cat /tmp/package-link.out >&2 || true
