@@ -15,7 +15,8 @@ jobs:
     timeout-minutes: 60
     env:
       REGISTRY: git.ciolan.net
-      IMAGE_OWNER: iAdrian
+      # Docker distribution names must be lowercase even though the Gitea user is iAdrian.
+      IMAGE_OWNER: iadrian
       IMAGE_NAME: hermes-agent
       PACKAGE_TYPE: container
       KEEP_VERSIONS: "5"
