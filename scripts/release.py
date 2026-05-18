@@ -640,6 +640,7 @@ AUTHOR_MAP = {
     "geoff.wellman@gmail.com": "geoffwellman",
     "han.shan@live.cn": "jamesarch",
     "haolong@microsoft.com": "LongOddCode",
+    "glennc@microsoft.com": "glennc",
     "hata1234@gmail.com": "hata1234",
     "hmbown@gmail.com": "Hmbown",
     "iacobs@m0n5t3r.info": "m0n5t3r",
@@ -1136,6 +1137,9 @@ AUTHOR_MAP = {
     "12735938+zwolniony@users.noreply.github.com": "zwolniony",
     "ambuj@dodopayments.com": "that-ambuj",  # PR #26582 (preserve underscores)
     "zccyman@163.com": "zccyman",  # PR #25294 (custom provider api_key_env alias)
+    # xAI cluster batch salvage (May 2026)
+    "lgndscntn@gmail.com": "Fewmanism",  # PR #27420 (threaded xAI OAuth callback)
+    "slimydog@Faisals-Mac-mini.local": "Slimydog21",  # PR #28021 (strip slash enums xAI Responses)
     "bitkyc08@gmail.com": "lidge-jun",  # PR #26814 (api server browser security headers)
     "sp_ps@Mac-mini.lan": "phoenixshen",  # PR #26768 (respect user-configured vision model)
     "1594534+phoenixshen@users.noreply.github.com": "phoenixshen",
