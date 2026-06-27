@@ -717,6 +717,26 @@ def classify_api_error(
 
     is_disconnect = any(p in error_msg for p in _SERVER_DISCONNECT_PATTERNS)
     if is_disconnect and not status_code:
+        # Reasoning-model override: a transport disconnect on a reasoning
+        # model is much more likely the upstream proxy idle-killing a
+        # long thinking stream than a true context overflow — even on
+        # large sessions.  The default disconnect+large-session routing
+        # below would otherwise send the user into the compression
+        # branch (should_compress=True) and silently delete
+        # conversation history on a phantom context-length error.
+        # Reasoning models have multi-minute thinking phases that
+        # routinely exceed the cloud gateway's idle window (NVIDIA
+        # NIM ~120s — first-party repro at NVIDIA/NemoClaw#4846;
+        # OpenAI worker / Anthropic stream-idle similar).  The
+        # per-reasoning-model stale-timeout floor in
+        # agent/reasoning_timeouts.py raises the stale-detector
+        # threshold to tolerate long thinking, so a true
+        # transport-layer failure here is recoverable via the retry
+        # path — not via context compression.  Reclassify as timeout.
+        # (Part 1 of Fixes #52310.)
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+        if get_reasoning_stale_timeout_floor(model) is not None:
+            return _result(FailoverReason.timeout, retryable=True)
         # Absolute token/message-count thresholds are only a proxy for smaller
         # context windows.  Large-context sessions can have hundreds of
         # messages while still being far below their actual token budget.
@@ -1192,6 +1212,20 @@ def _classify_by_message(
             retryable=False,
             should_rotate_credential=True,
             should_fallback=True,
+        )
+
+    # Overloaded / server-busy patterns — must come BEFORE the rate_limit and
+    # billing checks so that a message-only "overloaded" (no 503/529 status,
+    # e.g. some Anthropic-compatible proxies) classifies as a transient
+    # overload (backoff + retry) instead of falling through to `unknown` or
+    # incorrectly triggering credential rotation.
+    if any(p in error_msg for p in (
+        "overloaded", "temporarily overloaded",
+        "service is temporarily overloaded",
+    )):
+        return result_fn(
+            FailoverReason.overloaded,
+            retryable=True,
         )
 
     # Billing patterns
