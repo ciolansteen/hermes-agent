@@ -1609,6 +1609,145 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert captured["args"] == ["import", str(archive)]
 
+    def test_ops_backup_defaults_to_dashboard_downloadable_archive(self, monkeypatch):
+        from pathlib import Path
+
+        import hermes_cli.web_server as ws
+        from hermes_cli.config import get_hermes_home
+
+        captured = {}
+
+        def fake_spawn(subcommand, name):
+            captured["args"] = subcommand
+            captured["name"] = name
+            from types import SimpleNamespace as NS
+            return NS(pid=12345)
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fake_spawn)
+
+        resp = self.client.post("/api/ops/backup", json={})
+        assert resp.status_code == 200
+        data = resp.json()
+        archive = Path(data["archive"])
+
+        assert data["name"] == "backup"
+        assert captured["name"] == "backup"
+        assert captured["args"] == ["backup", str(archive)]
+        assert archive.parent == get_hermes_home() / "backups"
+        assert archive.name.startswith("hermes-backup-")
+        assert archive.suffix == ".zip"
+
+    def test_ops_backup_uses_hosted_hermes_home(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        import hermes_cli.web_server as ws
+
+        hosted_home = tmp_path / "opt-data"
+        monkeypatch.setenv("HERMES_HOME", str(hosted_home))
+        captured = {}
+
+        def fake_spawn(subcommand, name):
+            captured["args"] = subcommand
+            captured["name"] = name
+            from types import SimpleNamespace as NS
+            return NS(pid=12345)
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fake_spawn)
+
+        resp = self.client.post("/api/ops/backup", json={})
+        assert resp.status_code == 200
+        archive = Path(resp.json()["archive"])
+
+        assert archive.parent == hosted_home / "backups"
+        assert captured["args"] == ["backup", str(archive)]
+        assert archive.parent.is_dir()
+
+    def test_ops_backup_download_streams_dashboard_backup(self, tmp_path):
+        import hermes_cli.web_server as ws
+
+        backup_dir = ws._dashboard_backup_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        archive = backup_dir / "hermes-backup-test.zip"
+        archive.write_bytes(b"zip bytes")
+
+        resp = self.client.get(
+            "/api/ops/backup/download",
+            params={"archive": str(archive)},
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"zip bytes"
+        assert "attachment" in resp.headers["content-disposition"]
+
+        outside = tmp_path / "outside.zip"
+        outside.write_bytes(b"nope")
+        denied = self.client.get(
+            "/api/ops/backup/download",
+            params={"archive": str(outside)},
+        )
+        assert denied.status_code == 403
+
+    def test_ops_import_upload_stages_archive_and_passes_force(self, tmp_path, monkeypatch):
+        import zipfile
+        from pathlib import Path
+
+        import hermes_cli.web_server as ws
+
+        archive = tmp_path / "backup.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: {}\n")
+
+        captured = {}
+
+        def fake_spawn(subcommand, name):
+            captured["args"] = subcommand
+            captured["name"] = name
+            from types import SimpleNamespace as NS
+            return NS(pid=12345)
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fake_spawn)
+
+        resp = self.client.post(
+            "/api/ops/import-upload",
+            data={"force": "true"},
+            files={
+                "file": (
+                    "my backup.zip",
+                    archive.read_bytes(),
+                    "application/zip",
+                ),
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "import"
+        assert data["uploaded_bytes"] == archive.stat().st_size
+        staged = Path(captured["args"][1])
+        assert captured["name"] == "import"
+        assert captured["args"] == ["import", str(staged), "--force"]
+        assert staged.is_file()
+        assert staged.name.startswith("dashboard-import-")
+        assert staged.name.endswith("-my-backup.zip")
+        assert zipfile.is_zipfile(staged)
+        assert data["archive"] == str(staged)
+
+    def test_ops_import_upload_rejects_invalid_zip(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        def fail_spawn(*_args):
+            raise AssertionError("invalid uploads must not spawn import")
+
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fail_spawn)
+
+        resp = self.client.post(
+            "/api/ops/import-upload",
+            data={"force": "true"},
+            files={"file": ("backup.zip", b"not a zip", "application/zip")},
+        )
+
+        assert resp.status_code == 400
+        assert "valid zip" in resp.json()["detail"]
+
 
     def test_reveal_env_var(self, tmp_path):
         """POST /api/env/reveal should return the real unredacted value."""
@@ -4119,6 +4258,102 @@ class TestModelContextLength:
         })
         assert isinstance(result["model"], dict)
         assert result["model"]["context_length"] == 32000
+
+
+class TestDenormalizeProviderSwitch:
+    """The flat Config-page Model field carries no provider info. When the
+    model string changes to one served by a different provider, the saved
+    provider must follow it (issue #14058)."""
+
+    def test_vendor_slug_switches_off_non_aggregator_provider(self):
+        """ollama-local + a vendor/model slug → switch to openrouter and drop
+        the stale local base_url (the issue's exact repro)."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {
+                "default": "llama3.2",
+                "provider": "ollama-local",
+                "base_url": "http://localhost:11434/v1",
+                "api_mode": "chat_completions",
+            }
+        })
+
+        result = _denormalize_config_from_web({"model": "google/gemini-2.5-flash"})
+        model = result["model"]
+        assert model["provider"] == "openrouter"
+        assert model["default"] == "google/gemini-2.5-flash"
+        # The old ollama-local endpoint must not carry over to openrouter.
+        assert not model.get("base_url")
+
+    def test_unchanged_model_preserves_provider_and_base_url(self):
+        """Saving with the model unchanged must never re-detect/overwrite the
+        provider — protects unrelated config saves and custom endpoints."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {
+                "default": "llama3.2",
+                "provider": "ollama-local",
+                "base_url": "http://localhost:11434/v1",
+            }
+        })
+
+        result = _denormalize_config_from_web({"model": "llama3.2"})
+        model = result["model"]
+        assert model["provider"] == "ollama-local"
+        assert model["base_url"] == "http://localhost:11434/v1"
+
+    def test_bare_model_name_change_keeps_local_provider(self):
+        """A bare (non-slug) model name gives no provider signal — leave the
+        existing provider alone rather than guessing."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {
+                "default": "llama3.2",
+                "provider": "ollama-local",
+                "base_url": "http://localhost:11434/v1",
+            }
+        })
+
+        result = _denormalize_config_from_web({"model": "qwen2.5"})
+        model = result["model"]
+        assert model["provider"] == "ollama-local"
+        assert model["default"] == "qwen2.5"
+
+    def test_same_aggregator_model_swap_keeps_provider(self):
+        """Swapping models within an aggregator must not change the provider."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"}
+        })
+
+        result = _denormalize_config_from_web({"model": "google/gemini-2.5-flash"})
+        model = result["model"]
+        assert model["provider"] == "openrouter"
+        assert model["default"] == "google/gemini-2.5-flash"
+
+    def test_context_length_override_survives_provider_switch(self):
+        """An explicit context-length override must persist alongside a
+        provider switch."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({"model": {"default": "llama3.2", "provider": "ollama-local"}})
+
+        result = _denormalize_config_from_web({
+            "model": "google/gemini-2.5-flash",
+            "model_context_length": 128000,
+        })
+        model = result["model"]
+        assert model["provider"] == "openrouter"
+        assert model["context_length"] == 128000
 
 
 class TestModelContextLengthSchema:
