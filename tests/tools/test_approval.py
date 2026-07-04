@@ -14,7 +14,6 @@ from tools.approval import (
     _get_approval_mode,
     _normalize_approval_mode,
     _smart_approve,
-    _normalize_approval_timeout,
     approve_session,
     detect_dangerous_command,
     detect_hardline_command,
@@ -53,19 +52,6 @@ class TestApprovalModeParsing:
 
     def test_yaml_bool_true_maps_to_manual(self):
         assert _normalize_approval_mode(True) == "manual"
-
-
-class TestApprovalTimeoutParsing:
-    def test_positive_timeout_remains_seconds(self):
-        assert _normalize_approval_timeout(60) == 60
-        assert _normalize_approval_timeout("30") == 30
-
-    def test_zero_and_none_disable_timeout(self):
-        for raw in (0, "0", None, False, "none", "false", "never", "off", ""):
-            assert _normalize_approval_timeout(raw) is None
-
-    def test_invalid_timeout_falls_back_to_default(self):
-        assert _normalize_approval_timeout("bogus", default=42) == 42
 
 
 class TestSmartApproval:

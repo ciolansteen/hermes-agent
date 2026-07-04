@@ -135,20 +135,9 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-# Keep these installs split so the published image does not contain one
-# multi-GiB layer that is fragile to upload to smaller self-hosted registries.
 RUN npm install --prefer-offline --no-audit && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /root/.cache /tmp/camoufox-*
-RUN npx playwright install --with-deps chromium --only-shell && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /root/.cache /var/lib/apt/lists/* /tmp/camoufox-*
-RUN cd web && npm install --prefer-offline --no-audit && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /root/.cache /tmp/camoufox-*
-RUN cd ui-tui && npm install --prefer-offline --no-audit && \
-    npm cache clean --force && \
-    rm -rf /root/.npm /root/.cache /tmp/camoufox-*
+    npx playwright install --with-deps chromium --only-shell && \
+    npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
 # Copy only pyproject.toml + uv.lock so the Python dep resolve + wheel

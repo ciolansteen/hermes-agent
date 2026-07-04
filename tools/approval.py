@@ -1618,8 +1618,6 @@ def prompt_dangerous_approval(command: str, description: str,
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
-    else:
-        timeout_seconds = _normalize_approval_timeout(timeout_seconds)
 
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
@@ -1772,31 +1770,33 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
-def _normalize_approval_timeout(raw, default: int = 60) -> int | None:
-    """Normalize ``approvals.timeout`` values.
+def is_approval_bypass_active() -> bool:
+    """Return True when the user has opted out of Hermes approval prompts.
 
-    Returns an integer number of seconds for finite timeouts.  Returns
-    ``None`` when the configured value explicitly disables timeout-based
-    auto-denial.  This lets a human approval prompt remain pending while the
-    user is away, instead of treating absence as denial.
+    Collapses the canonical three-source bypass check used across the codebase
+    into one place:
+      - process-scoped ``--yolo`` / ``HERMES_YOLO_MODE`` (frozen at import time
+        so a mid-process skill can't flip it — a prompt-injection escalation
+        path; see ``_YOLO_MODE_FROZEN`` above),
+      - the session-scoped gateway ``/yolo`` toggle,
+      - ``approvals.mode: off`` in config.
+
+    This is the pure-bypass sub-expression only. Callers that also honor a
+    hardline blocklist / permanent allowlist must check those separately.
     """
-    if raw is None or raw is False:
-        return None
-    if isinstance(raw, str):
-        normalized = raw.strip().lower()
-        if normalized in {"", "0", "none", "false", "never", "off"}:
-            return None
-        raw = normalized
-    try:
-        value = int(raw)
-    except (ValueError, TypeError):
-        return default
-    return None if value <= 0 else value
+    return (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or _get_approval_mode() == "off"
+    )
 
 
-def _get_approval_timeout() -> int | None:
+def _get_approval_timeout() -> int:
     """Read the approval timeout from config. Defaults to 60 seconds."""
-    return _normalize_approval_timeout(_get_approval_config().get("timeout", 60))
+    try:
+        return int(_get_approval_config().get("timeout", 60))
+    except (ValueError, TypeError):
+        return 60
 
 
 def _get_cron_approval_mode() -> str:
