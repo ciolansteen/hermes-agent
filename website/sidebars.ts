@@ -71,6 +71,7 @@ const sidebars: SidebarsConfig = {
           label: 'Core',
           items: [
             'user-guide/features/tools',
+            'user-guide/features/document-extraction',
             'user-guide/features/tool-search',
             'user-guide/features/skills',
             'user-guide/features/lsp',
@@ -213,6 +214,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/github/github-codebase-inspection',
                     'user-guide/skills/bundled/github/github-github-auth',
                     'user-guide/skills/bundled/github/github-github-code-review',
+                    'user-guide/skills/bundled/github/github-github-issue-to-pr',
                     'user-guide/skills/bundled/github/github-github-issues',
                     'user-guide/skills/bundled/github/github-github-pr-workflow',
                     'user-guide/skills/bundled/github/github-github-repo-management',
@@ -262,6 +264,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/productivity/productivity-docx',
                     'user-guide/skills/bundled/productivity/productivity-google-workspace',
                     'user-guide/skills/bundled/productivity/productivity-maps',
+                    'user-guide/skills/bundled/productivity/productivity-meeting-action-items',
                     'user-guide/skills/bundled/productivity/productivity-nano-pdf',
                     'user-guide/skills/bundled/productivity/productivity-notion',
                     'user-guide/skills/bundled/productivity/productivity-ocr-and-documents',
