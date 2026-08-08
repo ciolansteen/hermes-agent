@@ -38,8 +38,12 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
     """ThreadPoolExecutor variant whose workers do not block process exit."""
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
+        # Mirrors CPython's ThreadPoolExecutor._adjust_thread_count but:
+        # - workers are daemon threads, and
+        # - workers are not registered in _threads_queues.
+        #
+        # Python 3.14 changed _worker to accept a WorkerContext instead of
+        # initializer/initargs. Build the tuple for the active stdlib layout.
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -52,13 +56,25 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
             t = threading.Thread(
                 name=thread_name,
                 target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
+                args=_daemon_worker_args(self, weakref_cb),
                 daemon=True,
             )
             t.start()
             self._threads.add(t)
+
+
+def _daemon_worker_args(executor, weakref_cb):
+    """Return _worker arguments for both legacy and Python 3.14 layouts."""
+    executor_ref = weakref.ref(executor, weakref_cb)
+    if hasattr(executor, "_create_worker_context"):
+        return (
+            executor_ref,
+            executor._create_worker_context(),
+            executor._work_queue,
+        )
+    return (
+        executor_ref,
+        executor._work_queue,
+        executor._initializer,
+        executor._initargs,
+    )
