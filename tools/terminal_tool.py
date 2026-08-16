@@ -2530,6 +2530,25 @@ def _resolve_command_cwd(
     return recorded or default_cwd
 
 
+def _execute_foreground_with_session_id(
+    env: Any,
+    command: str,
+    execute_kwargs: dict[str, Any],
+    session_id: Optional[str],
+) -> dict[str, Any]:
+    """Execute with the handler's task-local session identity.
+
+    Tool-worker threads can retain a different pre-bound ContextVar than the
+    explicit ``session_id`` supplied by the dispatcher.  Bind only around the
+    subprocess launch so nested Hermes commands write observability evidence
+    to the same conversation as file-tool edits, then restore the prior value.
+    """
+    from gateway.session_context import scoped_current_session_id
+
+    with scoped_current_session_id(session_id):
+        return env.execute(command, **execute_kwargs)
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -3278,7 +3297,9 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = _execute_foreground_with_session_id(
+                        env, command, execute_kwargs, session_id
+                    )
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
