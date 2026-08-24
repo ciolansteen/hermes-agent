@@ -1431,19 +1431,16 @@ def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     shutdown signal: the ``concurrent.futures`` module-global flag can be set
     a hair before ``sys.is_finalizing()`` flips, so matching the error text is
     a safe fallback for that race.
+
+    Thin wrapper — the predicate itself lives in
+    ``tools.interpreter_shutdown.interpreter_shutting_down`` (shared with the
+    conversation loop and the concurrent tool executor) so the shutdown-race
+    bug class is fixed in one place. Kept as a module symbol because tests
+    and callers throughout this file reference it by this name.
     """
-    if sys.is_finalizing():
-        return True
-    if exc is not None:
-        # Match the SHORT prefix deliberately: CPython emits two shutdown
-        # variants — "cannot schedule new futures after interpreter shutdown"
-        # (asyncio.run_coroutine_threadsafe / a torn-down default executor) and
-        # "cannot schedule new futures after shutdown" (a plain
-        # ThreadPoolExecutor). Both are documented in #58720. The common prefix
-        # catches both; the sibling agent/tool_executor._is_interpreter_shutdown_submit_error
-        # matches only the fuller "...after interpreter shutdown" form.
-        return "cannot schedule new futures" in str(exc).lower()
-    return False
+    from tools.interpreter_shutdown import interpreter_shutting_down
+
+    return interpreter_shutting_down(exc)
 
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
@@ -7070,7 +7067,14 @@ def _run_one_job_body(
                 delivery_attempted = True
                 delivery_error = _deliver_result(
                     job,
-                    _summarize_cron_failure_for_delivery(job, _err_text),
+                    # Composed exactly like the normal failure delivery above.
+                    # mark_job_run below records THIS run in failure_streak
+                    # whichever layer failed, so a job that fails before the
+                    # run body every tick builds a streak nobody is ever told
+                    # about: its alerts only ever leave through here, and the
+                    # nudge only ever left through there (#88655).
+                    _summarize_cron_failure_for_delivery(job, _err_text)
+                    + _failure_streak_nudge(job),
                     adapters=adapters,
                     loop=loop,
                 )
