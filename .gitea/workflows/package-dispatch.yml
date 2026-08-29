@@ -1,8 +1,6 @@
 name: Trigger Arch Package Build
 
 on:
-  push:
-    branches: [iAdrian]
   workflow_dispatch:
 
 concurrency:

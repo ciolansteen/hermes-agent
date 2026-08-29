@@ -1,0 +1,46 @@
+name: Sync Hermes upstream
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: hermes-upstream-autosync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: thinkie-autosync
+    timeout-minutes: 20
+    steps:
+      - name: Merge upstream main into iAdrian
+        env:
+          UPSTREAM_SSH_KEY: ${{ secrets.HERMES_UPSTREAM_SSH_KEY }}
+          DESTINATION_SSH_KEY: ${{ secrets.HERMES_SYNC_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${UPSTREAM_SSH_KEY:-}"
+          test -n "${DESTINATION_SSH_KEY:-}"
+          workdir="$(mktemp -d)"
+          cleanup() { rm -rf "$workdir"; }
+          trap cleanup EXIT
+          install -m 600 /dev/null "$workdir/upstream_key"
+          install -m 600 /dev/null "$workdir/destination_key"
+          printf '%s\n' "$UPSTREAM_SSH_KEY" > "$workdir/upstream_key"
+          printf '%s\n' "$DESTINATION_SSH_KEY" > "$workdir/destination_key"
+          upstream_ssh="ssh -i $workdir/upstream_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$workdir/known_hosts"
+          destination_ssh="ssh -i $workdir/destination_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$workdir/known_hosts"
+          GIT_SSH_COMMAND="$destination_ssh" git clone --branch iAdrian --single-branch git@ciolan.go.ro:iAdrian/hermes-agent.git "$workdir/repo"
+          cd "$workdir/repo"
+          git remote add upstream git@ciolan.go.ro:github-mirrors/hermes-agent.git
+          GIT_SSH_COMMAND="$upstream_ssh" git fetch --no-tags upstream main
+          git config user.name 'Hermes upstream autosync'
+          git config user.email 'autosync@ciolan.net'
+          git merge --no-edit upstream/main
+          GIT_SSH_COMMAND="$destination_ssh" git push origin HEAD:iAdrian
+          local_sha="$(git rev-parse HEAD)"
+          remote_sha="$(GIT_SSH_COMMAND="$destination_ssh" git ls-remote origin refs/heads/iAdrian | awk '{print $1}')"
+          test -n "$remote_sha"
+          test "$local_sha" = "$remote_sha"
+          printf 'verified iAdrian=%s\n' "$remote_sha"
