@@ -224,6 +224,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.upstage.ai/v1",
         base_url_env_var="UPSTAGE_BASE_URL",
     ),
+    "nebius-token-factory": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("NEBIUS_API_KEY", "NEBIUS_TOKEN_FACTORY_API_KEY"),
+        base_url_override="https://api.tokenfactory.nebius.com/v1",
+        base_url_env_var="NEBIUS_BASE_URL",
+    ),
     "ollama-cloud": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://ollama.com/v1",
@@ -404,6 +410,12 @@ ALIASES: Dict[str, str] = {
     "actual-computer": "actual",
     "actualcomputer": "actual",
     "aci": "actual",
+    # Nebius Token Factory
+    "nebius": "nebius-token-factory",
+    "nebius-tokenfactory": "nebius-token-factory",
+    "nebius-tf": "nebius-token-factory",
+    "token-factory": "nebius-token-factory",
+    "tokenfactory": "nebius-token-factory",
 
     # Local server aliases → virtual "local" concept (resolved via user config)
     "lmstudio": "lmstudio",
@@ -432,6 +444,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "upstage": "Upstage Solar",
     "actual": "Actual Computer",
     "tencent-tokenhub": "Tencent TokenHub",
+    "nebius-token-factory": "Nebius Token Factory",
     "lmstudio": "LM Studio",
     "local": "Local endpoint",
     "bedrock": "AWS Bedrock",
@@ -663,6 +676,10 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
       - api.meta.ai only achieves KV-cache hits on /v1/responses with
         prompt_cache_retention; /v1/chat/completions returns 0 cached
         tokens (measured 0% vs 93-99% on /responses with retention).
+      - api.router.com (Ramp Router) is Responses-native: per-model
+        reasoning-effort validation, reasoning summaries, and prompt
+        caching live on /v1/responses; /v1/chat/completions is only a
+        minimal compatibility shim translated onto it.
       - api.anthropic.com / ``…/anthropic`` suffixes speak native Messages.
       - Kimi's ``/coding`` endpoint speaks native Messages.
       - AWS Bedrock runtime hosts speak Converse.
@@ -694,6 +711,13 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
     # Responses API with prompt_cache_retention; chat/completions stays
     # cache-cold (0% vs 93-99% measured). Exact-hostname match per #32243.
     if hostname == "api.meta.ai":
+        return "codex_responses"
+    # Ramp Router (api.router.com) is Responses-native: reasoning-effort
+    # validation, reasoning summaries, and prompt caching live on
+    # /v1/responses, and /v1/chat/completions is only a minimal
+    # compatibility shim (docs.router.com/api/endpoint). Exact-hostname
+    # match per #32243.
+    if hostname == "api.router.com":
         return "codex_responses"
     if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
         return "bedrock_converse"
