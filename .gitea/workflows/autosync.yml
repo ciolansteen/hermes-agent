@@ -35,9 +35,29 @@ jobs:
           cd "$workdir/repo"
           git remote add upstream git@ciolan.go.ro:github-mirrors/hermes-agent.git
           GIT_SSH_COMMAND="$upstream_ssh" git fetch --no-tags upstream main
+
+          # The fork may carry Gitea automation only. Refuse source-tree drift
+          # before merging so local patches/reverts cannot become latent conflicts.
+          merge_base="$(git merge-base HEAD upstream/main)"
+          test -n "$merge_base"
+          unexpected_paths="$(git diff --name-only "$merge_base"..HEAD -- . ':!.gitea')"
+          if test -n "$unexpected_paths"; then
+            printf '%s\n' 'Refusing sync: fork-only changes exist outside .gitea:' >&2
+            printf '%s\n' "$unexpected_paths" >&2
+            exit 1
+          fi
+
           git config user.name 'Hermes upstream autosync'
           git config user.email 'autosync@ciolan.net'
           git merge --no-edit upstream/main
+
+          # A successful sync must reproduce upstream exactly outside .gitea.
+          if ! git diff --quiet upstream/main -- . ':!.gitea'; then
+            printf '%s\n' 'Refusing push: merged source tree differs from upstream outside .gitea.' >&2
+            git diff --name-status upstream/main -- . ':!.gitea' >&2
+            exit 1
+          fi
+
           GIT_SSH_COMMAND="$destination_ssh" git push origin HEAD:iAdrian
           local_sha="$(git rev-parse HEAD)"
           remote_sha="$(GIT_SSH_COMMAND="$destination_ssh" git ls-remote origin refs/heads/iAdrian | awk '{print $1}')"
