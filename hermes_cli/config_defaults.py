@@ -600,9 +600,9 @@ DEFAULT_CONFIG = {
         # instead of dropping the middle with a "summary unavailable" placeholder; the session
         # freezes at its size until /compress (bypasses the cooldown) or /new.
         "abort_on_summary_failure": False,
-        # (Historical key name.) When True, gpt-5.4/5.5/5.6 on the ChatGPT Codex OAuth route raise
-        # their compaction trigger to 85%: Codex hard-caps them at a 272K window, so the global 50%
-        # would compact at ~136K. False = global `threshold`. Only that route; the same models via
+        # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
+        # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
+        # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
         # OpenAI direct, OpenRouter or Copilot keep the global value.
         "codex_gpt55_autoraise": True,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
@@ -2273,6 +2273,9 @@ DEFAULT_CONFIG = {
         # gnome-libsecret|kwallet|kwallet5|kwallet6|basic force one (basic = unencrypted). Bridged
         # to HERMES_DESKTOP_PASSWORD_STORE; ignored off-Linux.
         "password_store": "auto",
+        # Linux: False preserves an existing custom XDG launcher entry; missing entries
+        # are still created. True keeps the generated entry current on each launch.
+        "manage_launcher_entry": True,
         # macOS only: code-signing identity (login-keychain cert; self-signed works) to re-sign
         # locally rebuilt apps so the Designated Requirement — and thus TCC grants — survives
         # updates. Empty = default ad-hoc identifier-pinned signing.

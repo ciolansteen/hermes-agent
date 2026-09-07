@@ -171,6 +171,7 @@ _LONG_HANDLERS = frozenset({
     "setup.runtime_check", "setup.status", "voice.toggle", "voice.record", "voice.tts", "wake.start",
     "wake.status", "session.active_list", "session.branch", "session.compress", "session.list",
     "session.resume", "session.workspace.move", "shell.exec", "skills.manage", "slash.exec",
+    "command.dispatch",  # /goal draft invokes the auxiliary model; never block the RPC reader
 })
 
 _rpc_pool_workers = max(2, env_int("HERMES_TUI_RPC_POOL_WORKERS", 8))
@@ -2274,6 +2275,9 @@ def _make_agent(
         with contextlib.suppress(Exception):
             importlib.import_module(_mod).wait_for_mcp_discovery()
     cfg = _load_cfg()
+    # Load hooks alongside the same profile config used to construct this agent.
+    from agent.shell_hooks import register_from_config
+    register_from_config(cfg)
     system_prompt = _startup_system_prompt(cfg, session_id or key)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     _pr = _load_provider_routing()
