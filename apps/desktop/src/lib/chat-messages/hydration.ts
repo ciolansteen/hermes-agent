@@ -159,6 +159,34 @@ function messageReactions(metadata: SessionMessage['display_metadata']): Message
   )
 }
 
+// Only parse producer-owned boundaries, never render the model's task preamble.
+// Older backends can persist an unwrapped result rather than an envelope.
+function asyncResultBody(content: string): string | undefined {
+  let bodies = [content]
+
+  if (content.startsWith('[ASYNC DELEGATION')) {
+    if (content.startsWith('[ASYNC DELEGATION BATCH COMPLETE')) {
+      // Task goals can span lines; stopping at a newline leaks the next goal and transcript footer.
+      bodies = content.split(/^--- [✓✗⚠] TASK \d+\/\d+(?:: [\s\S]*?)? {2}\(status=[^\n]*\) ---\r?\n/gm).slice(1)
+    } else {
+      const result = content.match(/^--- (?:RESULT|ERROR) ---\r?\n/m)
+      bodies = result ? [content.slice(result.index! + result[0].length)] : []
+    }
+  }
+
+  return (
+    bodies
+      .map(body => {
+        const output = body.startsWith('Cron job ') ? body.match(/^--- JOB OUTPUT ---\r?\n/m) : null
+        const result = output ? body.slice(output.index! + output[0].length) : body
+
+        return result.replace(/\nFull live transcript \(complete tool\/assistant trace\): [^\n]*\n*$/, '').trim()
+      })
+      .filter(Boolean)
+      .join('\n\n') || undefined
+  )
+}
+
 function timelineDisplayContent(message: SessionMessage, content: string): string {
   if (message.display_kind === 'model_switch') {
     return 'model changed'
@@ -381,6 +409,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
       parts,
+      ...(message.display_kind === 'async_delegation_complete'
+        ? { asyncResult: asyncResultBody(displayContentForMessage(message.role, message.content || content)) }
+        : {}),
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(reactions.length ? { reactions } : {}),
