@@ -705,6 +705,10 @@ export const en: Translations = {
       tabStripAuto: 'Auto',
       tabStripAlways: 'Always',
       tabStripNever: 'Never',
+      appActionsTitle: 'App Actions',
+      appActionsDesc: 'Where Settings, Layout, and HUD sit in the titlebar. Right leaves room for tabs on the left.',
+      appActionsLeft: 'Left',
+      appActionsRight: 'Right',
       terminalFontTitle: 'Terminal Font',
       terminalFontDesc:
         'Choose an installed font for Desktop terminals. Nerd Fonts render Powerlevel10k and shell icons; leave blank to use bundled JetBrains Mono.',
@@ -1309,9 +1313,12 @@ export const en: Translations = {
         'speed-gated-quality':
           'A higher-quality model fits this machine but would respond too slowly on its memory bandwidth — this is the best model that stays fast.',
         'fastest-resident':
-          'No model reaches full speed on this hardware; this one comes closest while running entirely in GPU memory.',
-        'least-painful-spilled': 'No model fits entirely in GPU memory here — this one runs best from system RAM.'
+          'No model reaches full speed on this hardware; this one comes closest while running entirely in GPU memory.'
       } as Record<string, string>,
+      noRecommendationTitle: 'No automatic recommendation for this machine',
+      noRecommendationDetail:
+        'Automatic setup requires a curated model that fits entirely in GPU or unified memory. You can still choose a model below or browse more models.',
+      noRecommendationAction: 'Browse models',
       downloaded: 'Downloaded',
       downloadAction: size => `Download · ${size}`,
       downloadProgress: (done, total) => `Downloading ${done} of ${total}`,
@@ -1323,7 +1330,7 @@ export const en: Translations = {
       quickstartDetailReady: model =>
         `One click makes ${model} your default for new chats. Everything runs on this machine.`,
       quickstartAction: 'Set up for me',
-      quickstartConfigure: 'Configure…',
+      quickstartConfigure: 'Let me choose',
       quickstartDoneToast: model => `${model} is set up — new chats run on this machine.`,
       quickstartFailed: 'Local model setup failed',
       quickstartStageEngine: 'Engine',
@@ -4236,6 +4243,9 @@ export const en: Translations = {
     resumeStrandedTitle: "Couldn't load this session",
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
+    poolSlotTimeoutBody:
+      'All local profile backend slots are busy. Increase Warm Bot Backends in Settings → Advanced, or retry after an idle backend is evicted.',
+    poolSlotTimeoutOpenSettings: 'Open Advanced Settings',
     resumeRetry: 'Retry',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',

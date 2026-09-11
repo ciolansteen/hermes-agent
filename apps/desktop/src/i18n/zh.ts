@@ -686,6 +686,10 @@ export const zh: Translations = {
       tabStripAuto: '自动',
       tabStripAlways: '始终',
       tabStripNever: '从不',
+      appActionsTitle: '应用操作',
+      appActionsDesc: '设置、布局和 HUD 放在标题栏左侧还是右侧。选右侧可给标签留出左边空间。',
+      appActionsLeft: '左侧',
+      appActionsRight: '右侧',
       terminalFontTitle: '终端字体',
       terminalFontDesc:
         '选择已安装的字体用于桌面端终端。Nerd Font 可正确显示 Powerlevel10k 和 Shell 图标；留空则使用内置的 JetBrains Mono。',
@@ -1481,7 +1485,7 @@ export const zh: Translations = {
         `一键完成所有设置：本地引擎、${model}（需下载 ${size}），并设为新会话的默认模型。数据不会离开这台电脑。`,
       quickstartDetailReady: model => `一键将 ${model} 设为新会话的默认模型。所有内容都在本机运行。`,
       quickstartAction: '为我设置',
-      quickstartConfigure: '自定义…',
+      quickstartConfigure: '让我选择',
       quickstartDoneToast: model => `${model} 已就绪——新会话将在本机运行。`,
       quickstartFailed: '本地模型设置失败',
       quickstartStageEngine: '引擎',
@@ -1497,9 +1501,12 @@ export const zh: Translations = {
       recommendedReason: {
         'best-quality-resident': '在完全驻留 GPU 且保持全速的模型中质量最高。推荐会在质量与该硬件的预计速度之间权衡。',
         'speed-gated-quality': '有更高质量的模型可以装入这台机器，但受内存带宽限制响应会太慢——这是保持流畅的最佳模型。',
-        'fastest-resident': '没有模型能在该硬件上达到全速；这是完全驻留 GPU 内存中最快的一个。',
-        'least-painful-spilled': '没有模型能完全装入 GPU 内存——这是从系统内存运行表现最好的一个。'
+        'fastest-resident': '没有模型能在该硬件上达到全速；这是完全驻留 GPU 内存中最快的一个。'
       } as Record<string, string>,
+      noRecommendationTitle: '此设备暂无自动推荐模型',
+      noRecommendationDetail:
+        '自动设置需要一个可完全放入显存或统一内存的精选模型。你仍可在下方自行选择，或浏览更多模型。',
+      noRecommendationAction: '浏览模型',
       downloaded: '已下载',
       downloadAction: size => `下载 · ${size}`,
       downloadProgress: (done, total) => `正在下载 ${done} / ${total}`,
@@ -4345,6 +4352,9 @@ export const zh: Translations = {
     readOnlyTranscriptSendBlocked: '该会话目前以只读记录方式打开——发送已禁用。',
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
+    poolSlotTimeoutBody:
+      '所有本地配置后端槽位都在使用中。请在“设置”→“高级”中增加 Warm Bot Backends，或等待空闲后端被驱逐后重试。',
+    poolSlotTimeoutOpenSettings: '打开高级设置',
     resumeRetry: '重试',
     nothingToBranch: '没有可分支的内容',
     branchNeedsChat: '分支前请先开始或恢复一个对话。',
