@@ -21,6 +21,7 @@ from agent.message_sanitization import (
 )
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, credential_pool_matches_provider, resolve_runtime_pool_key
@@ -33,10 +34,9 @@ logger = logging.getLogger(__name__)
 
 # Cap same-entry OAuth refreshes on a persistent auth failure, else a single-entry pool re-mints forever.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
-_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
 _REASONING_BLOCK_PATTERNS = tuple(
-    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE) for name in _REASONING_TAG_NAMES
+    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE) for name in THINK_TAG_NAMES
 )
 _TOOL_CALL_BLOCK_PATTERNS = tuple(
     re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
@@ -50,10 +50,10 @@ _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
     r'(?:(?:(?!</function>).)*)</function>', re.DOTALL | re.IGNORECASE,
 )
 _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
-    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
+    rf'(?:^|\n)[ \t]*<(?:{"|".join(THINK_TAG_NAMES)})\b[^>]*>.*$', re.DOTALL | re.IGNORECASE
 )
 _ORPHAN_REASONING_TAG_PATTERN = re.compile(
-    rf'</?(?:{"|".join(_REASONING_TAG_NAMES)})>\s*', re.IGNORECASE
+    rf'</?(?:{"|".join(THINK_TAG_NAMES)})>\s*', re.IGNORECASE
 )
 _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
     rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*', re.IGNORECASE
@@ -1207,7 +1207,7 @@ _TRANSIENT_TRANSPORT_ERRORS = frozenset({
 })
 _INLINE_REASONING_PATTERNS = tuple(
     re.compile(rf"<{tag}>(.*?)</{tag}>", re.DOTALL | re.IGNORECASE)
-    for tag in ("think", "thinking", "thought", "reasoning", "REASONING_SCRATCHPAD")
+    for tag in THINK_TAG_NAMES
 )
 
 
@@ -1735,7 +1735,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
     # CLOSE-WAIT. Injected into the local copy only, so each client gets its own httpx.Client;
-    # pinned by tests/run_agent/test_create_openai_client_reuse.py and
+    # pinned by tests/agent/test_create_openai_client_reuse.py and
     # test_sequential_chats_live.py. What IS shared across those per-client wrappers is the
     # connection pool: ``build_keepalive_http_client`` mounts a process-shared ``HTTPTransport``
     # behind a per-client view whose ``close()`` is a no-op for the pool, so a closed wrapper
@@ -2320,7 +2320,7 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     # character so the rest of the repair pipeline (lowercase / snake_case / fuzzy match) can resolve the
     # cleaned name to a real tool. Crucially we DO NOT split on whitespace: legitimate inputs like "write
     # file" must keep flowing through ``_norm`` -> ``write_file`` (covered by test_space_to_underscore in
-    # tests/run_agent/test_repair_tool_call_name.py). See #33007.
+    # tests/agent/test_repair_tool_call_name.py). See #33007.
     for _xml_sep in ('"', "'", "<", ">"):
         _idx = tool_name.find(_xml_sep)
         if _idx > 0:
