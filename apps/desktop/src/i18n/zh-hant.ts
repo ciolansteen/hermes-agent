@@ -191,7 +191,6 @@ export const zhHant = defineLocale({
       methodNotAllowed: '桌面後端拒絕了該請求 (405 Method Not Allowed)。請嘗試重新啟動 Hermes Desktop。',
       microphonePermission: '麥克風權限已被拒絕。',
       openaiRejectedApiKey: 'OpenAI 拒絕了該 API 金鑰。',
-      openaiRejectedApiKeyWithStatus: status => `OpenAI 拒絕了該 API 金鑰 (${status} invalid_api_key)。`,
       openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。',
       codeSkewRestartRequired: '更新後此後端仍在執行舊程式碼。請重新啟動以載入新程式碼。'
     },
@@ -3405,7 +3404,8 @@ export const zhHant = defineLocale({
     sudoSendFailed: '無法傳送 sudo 密碼',
     secretSendFailed: '無法傳送密鑰',
     sudoTitle: '管理員密碼',
-    sudoDesc: 'Hermes 需要您的 sudo 密碼來執行特權指令。它只會傳送給您的本機代理。',
+    sudoDesc: '輸入 sudo 密碼前，請先確認指令。密碼會傳送給執行指令的代理，並在本次工作階段中快取。',
+    sudoCommandUnavailable: '此代理未提供指令。如果無法在對話中確認，請取消。',
     sudoPlaceholder: 'sudo 密碼',
     secretTitle: '需要密鑰',
     secretDesc: 'Hermes 需要一個憑證才能繼續。',

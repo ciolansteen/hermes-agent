@@ -761,6 +761,19 @@ hermes config set skills.config.myplugin.path ~/myplugin-data
 
 For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/developer-guide/creating-skills#config-settings-configyaml).
 
+### Auto-loading skills every session
+
+Pin skills so they are fully loaded at the start of every new session, on every surface:
+
+```yaml
+skills:
+  auto_load:
+    - my-workflow
+    - github-pr-workflow
+```
+
+Resolved once per session when the system prompt is first built (so the prompt stays cache-stable; edits apply to the next session). Missing or disabled skills warn and are skipped; `--ignore-rules` / `HERMES_IGNORE_RULES=1` suppresses the list. Profile-scoped. See [CLI — persistent auto-load](/user-guide/cli#persistent-auto-load-via-config).
+
 ### Guard on agent-created skill writes
 
 When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:
@@ -2409,6 +2422,15 @@ whatsapp:
 
 - `pair` is the default for chat-style DM platforms. Hermes denies access, but replies with a one-time pairing code in DMs.
 - `ignore` silently drops unauthorized DMs.
+- `decline` sends one short, polite decline instead of a pairing code, then stays silent toward that sender for 24 hours. Override the default text:
+
+  ```yaml
+  unauthorized_dm_behavior: decline
+  unauthorized_dm_decline_message: "Sorry, this assistant is private."
+  ```
+
+  `hermes gateway setup` offers this as "Politely decline unknown senders" when you leave the allowlist empty; it writes `platforms.<platform>.unauthorized_dm_behavior: decline`.
+
 - Email defaults to `ignore` unless `platforms.email.unauthorized_dm_behavior: pair` is set, because inboxes can contain unrelated unread mail.
 - Platform sections override the global default, so you can keep pairing enabled broadly while making one platform quieter.
 
