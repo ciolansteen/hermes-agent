@@ -188,6 +188,49 @@ class TestDeletedProfileTombstone:
         assert "worker" not in backfilled
         assert not (profile_dir / ".env").exists()
 
+    def test_marker_less_shell_is_not_a_profile(self, profile_env):
+        """A ``profiles/<name>`` dir with no identity file (a pre-tombstone ghost shell left by a
+        cron ticker, or a stray infrastructure dir) is not listed, served, or seeded with the
+        default install's ``.env`` — that seeding is what legitimised ghosts on ``hermes update``
+        (#95188 path D, #94823, #99392). ``profile create`` may take the name back."""
+        default_env = profile_env / ".hermes" / ".env"
+        default_env.write_text("OPENAI_API_KEY=sk-real\n", encoding="utf-8")
+        shell = profile_env / ".hermes" / "profiles" / "ghost"
+        (shell / "cron").mkdir(parents=True)
+        (shell / "cron" / "ticker_heartbeat").write_text("1\n", encoding="utf-8")
+        legacy = profile_env / ".hermes" / "profiles" / "legacy"
+        legacy.mkdir()
+        (legacy / "state.db").write_bytes(b"")
+
+        assert backfill_profile_envs(quiet=True) == ["legacy"]
+        assert not (shell / ".env").exists()
+        assert _named_homes(profile_env) == ["legacy"]
+        assert [name for name, _ in profiles_to_serve(True)] == ["default", "legacy"]
+        # ``hermes --profile ghost serve`` (a stale Desktop boot target) must not start a backend
+        # in the shell — its ensure_hermes_home() would rebuild the full profile tree.
+        assert not profile_exists("ghost")
+        with pytest.raises(FileNotFoundError):
+            resolve_profile_env("ghost")
+        assert Path(resolve_profile_env("legacy")) == legacy
+
+        # A live marker-less dir may still hold user files: ``profile create`` must fail closed,
+        # naming the stray dir, and leave every byte in place (never rmtree a non-tombstoned dir).
+        (shell / "skills" / "my-skill").mkdir(parents=True)
+        (shell / "skills" / "my-skill" / "SKILL.md").write_text("# mine\n", encoding="utf-8")
+        with pytest.raises(FileExistsError, match=str(shell)):
+            create_profile("ghost", no_alias=True, no_skills=True)
+        assert (shell / "skills" / "my-skill" / "SKILL.md").exists()
+        assert "ghost" not in _named_homes(profile_env)
+
+    def test_dangling_symlink_marker_is_still_identity(self, profile_env):
+        """A profile whose only marker is a dangling symlinked ``config.yaml`` (clone/migration
+        leftover) stays resolvable: ``is_file()`` follows links and would make it invisible."""
+        legacy = profile_env / ".hermes" / "profiles" / "legacy"
+        legacy.mkdir(parents=True)
+        (legacy / "config.yaml").symlink_to(profile_env / "gone" / "config.yaml")
+        assert profile_exists("legacy")
+        assert Path(resolve_profile_env("legacy")) == legacy
+
     def test_create_after_delete_replaces_empty_shell(self, profile_env):
         profile_dir = create_profile("worker", no_alias=True, no_skills=True)
         _delete("worker")
