@@ -3620,6 +3620,7 @@ export const en: Translations = {
       xhigh: 'Extra High',
       max: 'Max',
       ultra: 'Ultra',
+      sendsOnRoute: (level: string) => `sends ${level} on this route`,
       updateFailed: 'Model option update failed',
       fastFailed: 'Fast mode update failed'
     },
@@ -4161,6 +4162,10 @@ export const en: Translations = {
       errorGenericProvider: 'The AI service',
       errorToastTitle: "Hermes couldn't finish the reply",
       errorRetry: 'Retry',
+      errorLimitResets: time => `Limit resets at ${time}`,
+      errorRetryAtReset: time => `Retry when the limit resets (${time})`,
+      errorRetryScheduled: (time, wait) => `Retrying at ${time} — in ${wait}`,
+      errorRetryScheduledCancel: 'Cancel',
       errorStartNewSession: 'Start new session',
       errorSwitchProvider: 'Switch provider',
       errorChooseModel: 'Choose a model',
