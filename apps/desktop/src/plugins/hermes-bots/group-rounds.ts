@@ -6,7 +6,7 @@
 import { host } from '@hermes/plugin-sdk'
 
 import { botFriendlyNames, botHandle, botMentionTag, mentionNameForms } from './data'
-import { recordGroupActivity } from './group-activity'
+import { groupFailureReason, recordGroupActivity } from './group-activity'
 import {
   $groupChats,
   $groupNeedsYou,
@@ -264,10 +264,59 @@ export function classifyGroupHoldDirective(
   }
 }
 
+/** #117040: what a fenced block, inline code span, straight-quoted span or
+ *  blockquote line says is content the user quotes or pastes, not a room
+ *  directive — its stop words must not hold a member. Mask each span down to
+ *  the @tokens it contains (mentions resolve from the raw text and must keep
+ *  their place in the proximity window, so an address like "…"@impl"…" still
+ *  releases a held member) or to one neutral filler word when it has none. */
+function maskQuotedAndCodeSpans(value: string): string {
+  const mentionsOnly = (span: string): string => (span.match(/@[\p{L}\p{N}._-]+/gu) || []).join(' ') || 'quoted'
+  const kept: string[] = []
+  let fence = ''
+
+  for (const line of value.split('\n')) {
+    if (fence) {
+      // Closing fence rows carry no content; an unterminated fence (a
+      // cut-short paste) simply swallows the rest of the message.
+      const closing = line.trim().startsWith(fence)
+
+      kept.push(closing ? '' : mentionsOnly(line))
+
+      if (closing) {
+        fence = ''
+      }
+
+      continue
+    }
+
+    const opened = line.match(/^\s*(`{3,}|~{3,})/)
+
+    if (opened) {
+      fence = opened[1]
+
+      continue
+    }
+
+    if (/^\s*>/.test(line)) {
+      kept.push(mentionsOnly(line))
+
+      continue
+    }
+
+    // Typographic quotes too: macOS smart-quote substitution rewrites the
+    // straight ones as the user types into the composer.
+    kept.push(line.replace(/`[^`\n]*`/g, mentionsOnly).replace(/["“”][^"“”\n]*["“”]/g, mentionsOnly))
+  }
+
+  return kept.join('\n')
+}
+
 /** #103893: where the stop/halt/pause tokens sit relative to the @tokens —
  *  `adjacent` when one is within two words of ANY mention, `distant` when
  *  the message carries a stop word but none that close, null without one.
- *  Proximity is measured against the raw @tokens,
+ *  Proximity is measured against the raw @tokens of the DIRECTIVE surface —
+ *  quoted/pasted spans are masked first (#117040) —
  *  not the resolved member keys the caller passes (those are roster keys
  *  such as `<connectionId>::<name>`, and a mention resolves through titles
  *  and friendly names too, so the @token text rarely equals the key). The
@@ -275,7 +324,7 @@ export function classifyGroupHoldDirective(
  *  halt" = 2, "@x go, das ist halt ein Test" = 4); widen only with measured
  *  cases, never by guessing. */
 function stopWordPlacement(value: string): 'adjacent' | 'distant' | null {
-  const tokens = value.toLowerCase().match(/@[\p{L}\p{N}._-]+|[\p{L}\p{N}_-]+/gu) || []
+  const tokens = maskQuotedAndCodeSpans(value).toLowerCase().match(/@[\p{L}\p{N}._-]+|[\p{L}\p{N}_-]+/gu) || []
   const mentionAt: number[] = []
   const stopAt: number[] = []
 
@@ -890,9 +939,10 @@ function queueGroupChatDrive(group: string, members: GroupMember[], thread: stri
         updateGroupChat(group, room => ({ ...room, running: true }))
         await runGroupChatRounds(group, nextMembers, nextThread, drive.failedMembers)
       }
-    } catch {
+    } catch (error) {
       if (binding.isLive()) {
-        recordGroupActivity(group, { kind: 'failed', member: null, thread: currentThread })
+        const reason = groupFailureReason(error)
+        recordGroupActivity(group, { kind: 'failed', member: null, thread: currentThread, ...(reason ? { reason } : {}) })
         updateGroupChat(group, room => ({ ...room, running: false, turn: null }))
       }
     } finally {

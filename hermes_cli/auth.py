@@ -431,6 +431,15 @@ def is_rate_limited_auth_error(error: Exception) -> bool:
             and error.code == CODEX_RATE_LIMITED_CODE)
 
 
+def primary_failure_wording(error: Exception) -> tuple[str, str]:
+    """``(log_phrase, user_phrase)`` for a primary-provider failure that triggers the fallback
+    chain. A 429/quota AuthError leaves the credentials valid; labelling it "auth failed" sends
+    operators hunting for an expired token (#117482), so it reads as quota at every surface."""
+    if is_rate_limited_auth_error(error):
+        return "rate-limited (429)", "Primary provider quota exhausted"
+    return "auth failed", "Primary auth failed"
+
+
 # Entitlement failures: Nous gets a Portal-aware message; other providers a fixed generic one (or
 # the raw error when no generic text exists for the code).
 _GENERIC_ENTITLEMENT_MESSAGES = {
@@ -975,6 +984,11 @@ def _config_selects_provider(normalized: str) -> bool:
     from hermes_cli.config import load_config
     cfg = load_config()
     if _slot_selects(cfg.get("model"), normalized):
+        return True
+    # ``auxiliary.<task>.provider: copilot`` selects the provider for that task the same way a MoA
+    # slot does — without this the seeder treats the credential as merely discovered (#114740).
+    aux_cfg = cfg.get("auxiliary")
+    if isinstance(aux_cfg, dict) and any(_slot_selects(s, normalized) for s in aux_cfg.values()):
         return True
 
     def _moa_block_matches(block: Any) -> bool:
