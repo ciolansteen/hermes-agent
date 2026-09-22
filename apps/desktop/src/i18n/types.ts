@@ -180,6 +180,7 @@ export interface Translations {
       writeFailed: string
       refreshFailed: string
       disconnectNoAccount: string
+      disconnectRefused: string
     }
     add: {
       action: string
@@ -224,6 +225,7 @@ export interface Translations {
       removeServerBody: string
       appSwitch: (name: string) => string
       waysTitle: (name: string) => string
+      wayNotConnected: (name: string) => string
       wayHosted: string
       bothOn: (name: string) => string
       turnOffLocal: string
@@ -713,6 +715,11 @@ export interface Translations {
         reviewedIntro: string
         restartToApply: string
         restartNow: string
+        connectServers: (name: string, n: number) => string
+        connectNow: string
+        connectSub: string
+        connectFailed: string
+        liveNow: (name: string) => string
         missingEnvAction: string
         alreadyInstalled: (name: string) => string
         desktopTarget: string
@@ -1381,7 +1388,8 @@ export interface Translations {
       deepLinkErrorConfig: string
       deepLinkErrorShape: string
       deepLinkErrorUrl: string
-      deepLinkErrorTooLarge: string}
+      deepLinkErrorTooLarge: string
+    }
     model: {
       loading: string
       appliesDesc: string
@@ -1763,6 +1771,15 @@ export interface Translations {
       toggleFailed: (name: string) => string
       legacyBackend: string
       portableBadge: string
+      serverStates: {
+        connected: string
+        app_not_running: string
+        endpoint_unavailable: string
+        no_interactive_session: string
+        version_too_old: string
+        missing_app: string
+        unknown: string
+      }
       catalogTitle: string
       catalogBrowse: string
       catalogHide: string
@@ -3636,6 +3653,14 @@ export interface Translations {
       saveComment: string
       cancelComment: string
     }
+  }
+
+  interfaceMode: {
+    title: string
+    hint: string
+    sessionNote: string
+    simple: { label: string; description: string }
+    advanced: { label: string; description: string }
   }
 
   zones: {
