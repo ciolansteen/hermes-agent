@@ -238,7 +238,10 @@ export function optimisticAttachmentRef(attachment: ComposerAttachment): string 
     // markdown image keeps them out of the data-URL extract path while still
     // rendering inline in the optimistic bubble (#63682).
     if (attachment.previewUrl?.startsWith('blob:')) {
-      const alt = attachment.label || 'image'
+      // Percent-encode the alt text: a filename with `]` or parens in it would
+      // otherwise break the Markdown-image form the directive parser matches
+      // below, and the raw expression would leak into visible text (#123368).
+      const alt = encodeURIComponent(attachment.label || 'image')
 
       return `![${alt}](${attachment.previewUrl})`
     }
@@ -291,10 +294,12 @@ export function personalityNamesFromConfig(config: unknown): string[] {
   // whitespace-padded, or neutral-named block doesn't surface a row the runtime
   // can never resolve, and a root/agent case clash dedupes to one canonical name.
   const names = new Set<string>()
+
   for (const block of [root.personalities, agent.personalities]) {
     if (block && typeof block === 'object' && !Array.isArray(block)) {
       for (const name of Object.keys(block as Record<string, unknown>)) {
         const key = foldPersonalityName(name)
+
         if (key) {
           names.add(key)
         }
