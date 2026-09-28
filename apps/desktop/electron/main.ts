@@ -267,7 +267,7 @@ import { resolveGatewayVersion } from './gateway-version'
 import { probeGatewayWebSocket, spawnedBackendProbeOptions } from './gateway-ws-probe'
 import { windowsGitCandidates } from './git-binary-candidates'
 import { registerGitIpc } from './git-ipc'
-import { desktopBackendSpawnEnv, guestOnboardingEnabled, skipIntroEnabled } from './guest-onboarding'
+import { desktopBackendSpawnEnv, guestOnboardingEnabled } from './guest-onboarding'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   assertExistingPathForOpen,
@@ -311,7 +311,6 @@ import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import { INSTALL_STAMP, installShape } from './install-stamp'
 import type { InstallStamp } from './install-stamp'
-import { createIntroRevealWindowController } from './intro-reveal-window'
 import { applyLaunchProfileOverride } from './launch-profile'
 import { CURL_TITLE_WRITE_OUT, parseCurlTitleResponse } from './link-title-curl'
 import { canonicalTitleCacheKey, isFetchableHttpUrl } from './link-title-url'
@@ -1086,7 +1085,6 @@ const BOOT_FAKE_ERROR = process.env.HERMES_DESKTOP_BOOT_FAKE_ERROR || ''
 const SKIP_QUIT_CONFIRM = process.env.HERMES_DESKTOP_SKIP_QUIT_CONFIRM === '1'
 // One launch decision must reach both the renderer and every backend spawn.
 const GUEST_ONBOARDING: boolean = guestOnboardingEnabled()
-const SKIP_INTRO: boolean = skipIntroEnabled()
 
 const BOOT_FAKE_STEP_MS = (() => {
   const raw = Number.parseInt(String(process.env.HERMES_DESKTOP_BOOT_FAKE_STEP_MS || ''), 10)
@@ -13603,10 +13601,11 @@ function focusWindow(win) {
 }
 
 function spawnSecondaryWindow({
+  connectionId,
   sessionId,
   profile,
   watch
-}: { sessionId?: string; profile?: null | string; watch?: boolean } = {}) {
+}: { connectionId?: null | string; sessionId?: string; profile?: null | string; watch?: boolean } = {}) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -13675,6 +13674,7 @@ function spawnSecondaryWindow({
   loadWindowUrl(
     win,
     buildSessionWindowUrl(sessionId, {
+      connectionId,
       devServer: DEV_SERVER,
       profile,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
@@ -13687,8 +13687,8 @@ function spawnSecondaryWindow({
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { profile = null, watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, profile, watch }))
+function createSessionWindow(sessionId, { connectionId = null, profile = null, watch = false } = {}) {
+  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ connectionId, sessionId, profile, watch }))
 }
 
 // Popped-out in-app Browser: same webview + address bar as a docked Browser
@@ -13891,22 +13891,6 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
   wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
-})
-
-const introRevealController: ReturnType<typeof createIntroRevealWindowController> = createIntroRevealWindowController({
-  devServer: DEV_SERVER,
-  enabled: GUEST_ONBOARDING,
-  isMac: IS_MAC,
-  loadWindowUrl,
-  log: rememberLog,
-  mainWindow: (): BrowserWindow | null => mainWindow,
-  preloadPath: PRELOAD_PATH,
-  rendererIndex: resolveRendererIndex,
-  showMain: (): void => {
-    mainWindow.show()
-    mainWindow.focus()
-  },
-  wireWindow: (window: BrowserWindow): void => wireCommonWindowHandlers(window, zoomWiringForWindowKind('petOverlay'))
 })
 
 registerChatOnboardingWindow({ enabled: GUEST_ONBOARDING, mainWindow: (): BrowserWindow | null => mainWindow })
@@ -15028,7 +15012,6 @@ function createWindow() {
   mainWindow.on('closed', () => {
     closePetOverlay()
     wakeIndicatorController.close()
-    introRevealController.destroy()
 
     if (mainWindow === createdMainWindow) {
       mainWindow = null
@@ -15488,6 +15471,7 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   }
 
   createSessionWindow(sessionId.trim(), {
+    connectionId: typeof opts?.connectionId === 'string' ? opts.connectionId : null,
     profile: typeof opts?.profile === 'string' ? opts.profile : null,
     watch: opts?.watch === true
   })
@@ -16139,165 +16123,167 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
     }
   }
 
-  return withoutInteractiveOauthLogin(() => Promise.all(
-    registry.connections.map(async connection => {
-      let sourceFailureDetail = ''
+  return withoutInteractiveOauthLogin(() =>
+    Promise.all(
+      registry.connections.map(async connection => {
+        let sourceFailureDetail = ''
 
-      let raw: {
-        connection: typeof connection
-        error?: string
-        needsSignIn?: boolean
-        installId?: string
-        profiles: null | string[]
-        profileMetadata?: Record<string, RosterProfileMetadata>
-      }
+        let raw: {
+          connection: typeof connection
+          error?: string
+          needsSignIn?: boolean
+          installId?: string
+          profiles: null | string[]
+          profileMetadata?: Record<string, RosterProfileMetadata>
+        }
 
-      try {
-        // SSH roster listing must never spawn a dashboard. A stale
-        // sshConnections key used to fall into ensureRegistryBackend and
-        // respawn Spark/Mini every Bot Mode poll (~5s), then the mux died
-        // (ECONNRESET / liveness probe drop).
-        if (connection.kind === 'ssh') {
-          await probeSshProfileInventory(connection)
-          // The inventory probe learns the backend's install id on its own session; carrying it
-          // here is what lets two ssh addresses for one machine collapse to one row.
+        try {
+          // SSH roster listing must never spawn a dashboard. A stale
+          // sshConnections key used to fall into ensureRegistryBackend and
+          // respawn Spark/Mini every Bot Mode poll (~5s), then the mux died
+          // (ECONNRESET / liveness probe drop).
+          if (connection.kind === 'ssh') {
+            await probeSshProfileInventory(connection)
+            // The inventory probe learns the backend's install id on its own session; carrying it
+            // here is what lets two ssh addresses for one machine collapse to one row.
+            raw = {
+              connection,
+              profiles: null,
+              error: 'connect-on-demand',
+              installId: connectionInstallIds.get(connection.id)?.id
+            }
+          } else {
+            // Same connect-on-demand courtesy for the forced-local path: when
+            // the primary route is remote, enumerating "This device" would
+            // SPAWN a local backend this user has never asked for — a phantom
+            // `default` agent that also forces -device handle disambiguation
+            // onto the real one (remote-gateway-only desktops showed their main
+            // agent twice, Aug 17 2026). Enumerate the local source only when
+            // it is the delegate route (local-primary desktops, unchanged
+            // behavior) or a forced-local child is ALREADY pooled (the user
+            // opened one).
+            if (connection.kind === 'local') {
+              const localRoute = resolveRegistryLocalRoute('default', {
+                globalRemote: globalRemoteActive(),
+                profileRemoteOverride: Boolean(profileHasRemoteOverride(primaryProfileKey()))
+              })
+
+              if (shouldDeferLocalEnumeration(localRoute, backendPool.keys(), connection.id)) {
+                return { connection, profiles: null, error: 'connect-on-demand' }
+              }
+            }
+
+            // Claim-guarded (#90812): this ~5s roster poll can race a renderer's
+            // own reconnect dial for the same connection; coalescing avoids
+            // bootstrapping a second SSH tunnel / remote dashboard.
+            const descriptor: any = await withEnumerationDeadline(
+              Promise.resolve(
+                backendDialClaims.run(backendScopeKey(connection.id, null), () =>
+                  ensureRegistryBackend(connection.id, null)
+                )
+              ),
+              rosterSourceEnumerationTimeoutMs(connection)
+            )
+
+            const { body, installId } = await fetchRosterSourceData(
+              () => getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 }),
+              () => probeConnectionInstallId(connection.id, descriptor)
+            )
+
+            // The install-id probe is TTL-cached, so the 5s roster poll usually
+            // pays zero extra requests; on a miss it runs beside /api/profiles.
+
+            const profiles = Array.isArray(body?.profiles)
+              ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
+              : []
+
+            const profileMetadata = Array.isArray(body?.profiles)
+              ? Object.fromEntries(
+                  body.profiles
+                    .map(profile => {
+                      const name = String(profile?.name || '').trim()
+
+                      if (!name) {
+                        return null
+                      }
+
+                      const metadata: RosterProfileMetadata = {}
+
+                      if (typeof profile?.display_name === 'string' && profile.display_name.trim()) {
+                        metadata.display_name = profile.display_name.trim()
+                      }
+
+                      if (typeof profile?.title === 'string' && profile.title.trim()) {
+                        metadata.title = profile.title.trim()
+                      }
+
+                      if (profile?.ui_meta && typeof profile.ui_meta === 'object') {
+                        metadata.ui_meta = profile.ui_meta
+                      }
+
+                      if (typeof profile?.has_avatar === 'boolean') {
+                        metadata.has_avatar = profile.has_avatar
+                      }
+
+                      return [name, metadata] as const
+                    })
+                    .filter((entry): entry is readonly [string, RosterProfileMetadata] => Boolean(entry))
+                )
+              : undefined
+
+            // The root HERMES_HOME is an agent too; enumerations that omit it
+            // (older backends list only named profiles) still get a default row.
+            if (!profiles.includes('default')) {
+              profiles.unshift('default')
+            }
+
+            raw = {
+              connection,
+              profiles,
+              ...(installId ? { installId } : {}),
+              ...(profileMetadata ? { profileMetadata } : {})
+            }
+          }
+        } catch (error: any) {
+          sourceFailureDetail = [error?.statusCode, error?.cause?.message].filter(Boolean).join(' | ')
           raw = {
             connection,
             profiles: null,
-            error: 'connect-on-demand',
-            installId: connectionInstallIds.get(connection.id)?.id
-          }
-        } else {
-          // Same connect-on-demand courtesy for the forced-local path: when
-          // the primary route is remote, enumerating "This device" would
-          // SPAWN a local backend this user has never asked for — a phantom
-          // `default` agent that also forces -device handle disambiguation
-          // onto the real one (remote-gateway-only desktops showed their main
-          // agent twice, Aug 17 2026). Enumerate the local source only when
-          // it is the delegate route (local-primary desktops, unchanged
-          // behavior) or a forced-local child is ALREADY pooled (the user
-          // opened one).
-          if (connection.kind === 'local') {
-            const localRoute = resolveRegistryLocalRoute('default', {
-              globalRemote: globalRemoteActive(),
-              profileRemoteOverride: Boolean(profileHasRemoteOverride(primaryProfileKey()))
-            })
-
-            if (shouldDeferLocalEnumeration(localRoute, backendPool.keys(), connection.id)) {
-              return { connection, profiles: null, error: 'connect-on-demand' }
-            }
-          }
-
-          // Claim-guarded (#90812): this ~5s roster poll can race a renderer's
-          // own reconnect dial for the same connection; coalescing avoids
-          // bootstrapping a second SSH tunnel / remote dashboard.
-          const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
-            ),
-            rosterSourceEnumerationTimeoutMs(connection)
-          )
-
-          const { body, installId } = await fetchRosterSourceData(
-            () => getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 }),
-            () => probeConnectionInstallId(connection.id, descriptor)
-          )
-
-          // The install-id probe is TTL-cached, so the 5s roster poll usually
-          // pays zero extra requests; on a miss it runs beside /api/profiles.
-
-          const profiles = Array.isArray(body?.profiles)
-            ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
-            : []
-
-          const profileMetadata = Array.isArray(body?.profiles)
-            ? Object.fromEntries(
-                body.profiles
-                  .map(profile => {
-                    const name = String(profile?.name || '').trim()
-
-                    if (!name) {
-                      return null
-                    }
-
-                    const metadata: RosterProfileMetadata = {}
-
-                    if (typeof profile?.display_name === 'string' && profile.display_name.trim()) {
-                      metadata.display_name = profile.display_name.trim()
-                    }
-
-                    if (typeof profile?.title === 'string' && profile.title.trim()) {
-                      metadata.title = profile.title.trim()
-                    }
-
-                    if (profile?.ui_meta && typeof profile.ui_meta === 'object') {
-                      metadata.ui_meta = profile.ui_meta
-                    }
-
-                    if (typeof profile?.has_avatar === 'boolean') {
-                      metadata.has_avatar = profile.has_avatar
-                    }
-
-                    return [name, metadata] as const
-                  })
-                  .filter((entry): entry is readonly [string, RosterProfileMetadata] => Boolean(entry))
-              )
-            : undefined
-
-          // The root HERMES_HOME is an agent too; enumerations that omit it
-          // (older backends list only named profiles) still get a default row.
-          if (!profiles.includes('default')) {
-            profiles.unshift('default')
-          }
-
-          raw = {
-            connection,
-            profiles,
-            ...(installId ? { installId } : {}),
-            ...(profileMetadata ? { profileMetadata } : {})
+            error: redactSecrets(String(error?.message || error)),
+            needsSignIn:
+              isReauthRequiredError(error) || (connection.authMode === 'oauth' && isGatewayAuthRejection(error))
           }
         }
-      } catch (error: any) {
-        sourceFailureDetail = [error?.statusCode, error?.cause?.message].filter(Boolean).join(' | ')
-        raw = {
+
+        if (raw.error && raw.error !== 'connect-on-demand') {
+          const diagnostic = redactSecrets([raw.error, sourceFailureDetail].filter(Boolean).join(' | '))
+            .replace(/[\r\n]+/g, ' ')
+            .slice(0, 800)
+
+          if (rosterSourceErrors.get(connection.id) !== diagnostic) {
+            rememberLog(`[fleet-roster] ${connection.id}: ${diagnostic}`)
+            rosterSourceErrors.set(connection.id, diagnostic)
+          }
+        } else if (raw.profiles && rosterSourceErrors.delete(connection.id)) {
+          rememberLog(`[fleet-roster] ${connection.id}: connection recovered`)
+        }
+
+        if (raw.profiles && raw.profiles.length > 0) {
+          sshRosterCache.set(connection.id, raw.profiles)
+        }
+
+        const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
+
+        return {
           connection,
-          profiles: null,
-          error: redactSecrets(String(error?.message || error)),
-          needsSignIn: isReauthRequiredError(error) ||
-            (connection.authMode === 'oauth' && isGatewayAuthRejection(error))
+          ...remembered,
+          ...(raw.needsSignIn ? { needsSignIn: true } : {}),
+          ...(raw.installId ? { installId: raw.installId } : {}),
+          ...(raw.profileMetadata ? { profileMetadata: raw.profileMetadata } : {})
         }
-      }
-
-      if (raw.error && raw.error !== 'connect-on-demand') {
-        const diagnostic = redactSecrets([raw.error, sourceFailureDetail].filter(Boolean).join(' | '))
-          .replace(/[\r\n]+/g, ' ')
-          .slice(0, 800)
-
-        if (rosterSourceErrors.get(connection.id) !== diagnostic) {
-          rememberLog(`[fleet-roster] ${connection.id}: ${diagnostic}`)
-          rosterSourceErrors.set(connection.id, diagnostic)
-        }
-      } else if (raw.profiles && rosterSourceErrors.delete(connection.id)) {
-        rememberLog(`[fleet-roster] ${connection.id}: connection recovered`)
-      }
-
-      if (raw.profiles && raw.profiles.length > 0) {
-        sshRosterCache.set(connection.id, raw.profiles)
-      }
-
-      const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
-
-      return {
-        connection,
-        ...remembered,
-        ...(raw.needsSignIn ? { needsSignIn: true } : {}),
-        ...(raw.installId ? { installId: raw.installId } : {}),
-        ...(raw.profileMetadata ? { profileMetadata: raw.profileMetadata } : {})
-      }
-    })
-  ))
+      })
+    )
+  )
 }
 
 ipcMain.handle('hermes:agents:roster', async () => {
@@ -17814,8 +17800,7 @@ ipcMain.on('hermes:feature-flags', (event: IpcMainEvent): void => {
       argv: process.argv,
       canary: resolveUpdaterChannelFromStamp() === 'canary'
     }),
-    guestOnboarding: GUEST_ONBOARDING,
-    skipIntro: SKIP_INTRO
+    guestOnboarding: GUEST_ONBOARDING
   }
 })
 
@@ -19150,7 +19135,6 @@ app.on('before-quit', event => {
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
   wakeIndicatorController.close()
-  introRevealController.destroy()
 
   // Same for the HUD — an always-on-top panel outliving the app would leave a
   // floating composer with nothing behind it. Close it directly rather than via

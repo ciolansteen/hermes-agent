@@ -733,7 +733,7 @@ def _resume_locate(ctx: _Resume) -> dict | None:
     if ctx.found:
         ctx.target = ctx.found["id"]
         return None
-    if ctx.lazy and _child_run_active(ctx.target):
+    if ctx.lazy and _child_run_active(ctx.target, ctx.profile_home):
         # Fresh subagent watch window: `subagent.start` relays BEFORE the child's first DB flush. Proceed lazily
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
         ctx.found = {}
@@ -803,7 +803,7 @@ def _resume_reuse_live_locked(ctx: _Resume, sid: str, session: dict) -> dict:
         payload.update(messages=[], hydrating=bool(session.get("resume_hydrating")),
                        message_count=int(session.get("resume_message_count") or payload["message_count"]))
     # A lazy watch session never owns a run loop — overlay the child-run registry.
-    if session.get("agent") is None and _child_run_active(ctx.target):
+    if session.get("agent") is None and _child_run_active(ctx.target, ctx.profile_home):
         payload.update(running=True, status="streaming")
     return _ok(ctx.rid, payload)
 
@@ -841,7 +841,7 @@ def _resume_lazy(ctx: _Resume) -> dict:
     if (reused := ctx.claim(sid, record)) is not None:
         return reused
     # A child mid-run emits no session events — liveness comes from the relay registry.
-    running = _child_run_active(ctx.target)
+    running = _child_run_active(ctx.target, ctx.profile_home)
     # Display uses the VERBATIM child-only projection so model-invisible rows survive; repaired ``history``
     # still feeds live replay.
     display = history
@@ -2064,8 +2064,10 @@ def _(rid, params: dict, session: dict) -> dict:
     if _session_uses_compute_host(session):
         return _save_via_compute_host(rid, params)
     agent = session["agent"]
-    # Classic CLI /save: under the profile home, with the system prompt (dashboard parity).
-    saved_dir = get_hermes_home() / "sessions" / "saved"
+    # Classic CLI /save: under the profile home, with the system prompt (dashboard parity). The SESSION's
+    # profile: this handler runs unscoped, so get_hermes_home() alone names the launch profile.
+    home = session.get("profile_home")
+    saved_dir = (Path(home) if home else get_hermes_home()) / "sessions" / "saved"
     try:
         saved_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
