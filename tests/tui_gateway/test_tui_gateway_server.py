@@ -3070,8 +3070,7 @@ def test_expand_skill_invocation_for_replay_round_trips_the_projection(
     )
     monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
     monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda *a, **k: [])
-    monkeypatch.setattr(skill_commands, "_skill_commands", {})
-    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {})
     skill_commands.scan_skill_commands()
 
     expanded = server._expand_skill_invocation_for_replay(
@@ -3087,8 +3086,7 @@ def test_expand_skill_invocation_for_replay_leaves_ordinary_text_alone(monkeypat
     import agent.skill_utils as skill_utils
 
     monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda *a, **k: [])
-    monkeypatch.setattr(skill_commands, "_skill_commands", {})
-    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {})
 
     assert server._expand_skill_invocation_for_replay("just words", "t") == "just words"
     # A core slash command is not a skill — nothing to expand.
@@ -3120,8 +3118,7 @@ def _two_repo_project_skill_sessions(tmp_path, monkeypatch) -> tuple[Path, Path]
     monkeypatch.setattr(skill_utils, "_skills_cfg", lambda: {
         "external_dirs": [], "trusted_project_dirs": [str(repo_a), str(repo_b)]})
     skill_utils._external_dirs_cache_clear()
-    monkeypatch.setattr(skill_commands, "_skill_commands", {})
-    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {})
     # Launch shape: process cwd and TERMINAL_CWD both point at a non-project dir (the resolved placeholder).
     elsewhere = tmp_path / "home-dir"
     elsewhere.mkdir()
@@ -3166,7 +3163,12 @@ def test_complete_slash_and_skills_reload_are_bound_to_the_session_cwd(tmp_path,
     assert server._methods["command.dispatch"]("d", {"name": "alpha-skill", "arg": "", "session_id": "sid-a"})[
         "result"]["type"] == "skill"
     reload = server._methods["skills.reload"]("r", {"session_id": "sid-a"})["result"]
-    assert reload["result"]["removed"] == [] and "/alpha-skill" in skill_commands._skill_commands, reload["output"]
+    assert reload["result"]["removed"] == [], reload["output"]
+    # The session-bound registry still offers the project skill after the reload
+    # (the multi-slot cache keeps each session-identity's view; the launch-env
+    # identity outside any session legitimately sees none of them).
+    items = server._methods["complete.slash"]("s", {"text": "/alph", "session_id": "sid-a"})["result"]["items"]
+    assert [i["text"] for i in items if i["kind"] == "skill"] == ["alpha-skill"], reload["output"]
     # Another session's reload resolves ITS repo, not the launch env.
     other = server._methods["skills.reload"]("r", {"session_id": "sid-b"})["result"]
     assert {i["name"] for i in other["result"]["added"]} == {"beta-skill"}, other["output"]
@@ -12121,6 +12123,28 @@ def test_rollback_restore_resolves_number_and_file_path():
     assert resp["result"]["success"] is True
     assert calls["args"][1] == "bbb222"
     assert calls["args"][2] == "src/app.tsx"
+
+
+def test_rollback_list_carries_checkpoint_reason_as_message():
+    reason = "before write_file: a.py [nested git repos not captured: tool]"
+
+    class _Mgr:
+        enabled = True
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "aaa111", "short_hash": "aaa", "timestamp": "2026-09-29T10:00:00+00:00",
+                     "reason": reason, "files_changed": 1}]
+
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()), history=[]
+    )
+    resp = server.handle_request(
+        {"id": "1", "method": "rollback.list", "params": {"session_id": "sid"}}
+    )
+
+    row = resp["result"]["checkpoints"][0]
+    assert row["hash"] == "aaa111"
+    assert row["message"] == reason
 
 
 def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
