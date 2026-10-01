@@ -2828,6 +2828,40 @@ describe('usePromptActions redirectPrompt', () => {
     expect(await handle!.redirectPrompt('too late')).toBe(false)
   })
 
+  it('refuses to steer a session with no live turn — no echo, no RPC (#105176)', async () => {
+    // The composer's busy belief lags the slice by an effect tick on the
+    // busy→false settle edge, so a steer can reach redirectPrompt for a session
+    // whose turn already settled: not busy, no stream, not awaiting a response.
+    // There is nothing to redirect, so it must NOT echo a bubble into this chat
+    // nor RPC an idle session — returning false lets the caller queue the text
+    // for the conversation whose run is actually live.
+    publishSessionState(RUNTIME_SESSION_ID, createClientSessionState(RUNTIME_SESSION_ID))
+
+    try {
+      const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+      // The stale belief: busy was true when the steer was fired.
+      const staleBusyRef = { current: true }
+
+      let handle: HarnessHandle | null = null
+      const capturedStates: Record<string, unknown>[] = []
+      await actRender(
+        <Harness
+          busyRef={staleBusyRef}
+          onReady={h => (handle = h)}
+          onSeedState={state => capturedStates.push(state)}
+          refreshSessions={async () => undefined}
+          requestGateway={requestGateway}
+        />
+      )
+
+      expect(await handle!.redirectPrompt('stale steer')).toBe(false)
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(capturedStates).toEqual([])
+    } finally {
+      dropSessionState(RUNTIME_SESSION_ID)
+    }
+  })
+
   it('reports rejection without throwing when the redirect RPC errors', async () => {
     const requestGateway = vi.fn(async () => {
       throw new Error('agent does not support redirect')
@@ -3150,6 +3184,7 @@ describe('usePromptActions restoreToMessage', () => {
     $messages.set(initialMessages as never)
 
     let submitAttempts = 0
+
     const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
       if (method === 'prompt.submit') {
         submitAttempts += 1
@@ -3695,7 +3730,6 @@ describe('usePromptActions file attachment sync', () => {
       params: { session_id: RUNTIME_SESSION_ID, text: '@file:data/report.txt\n\nsummarize' }
     })
   })
-
 })
 
 describe('usePromptActions eager-upload races', () => {
@@ -6356,11 +6390,7 @@ describe('usePromptActions stale multi-window guard (#65047)', () => {
 
     let handle: HarnessHandle | null = null
     await actRender(
-      <Harness
-        onReady={h => (handle = h)}
-        refreshSessions={async () => undefined}
-        requestGateway={requestGateway}
-      />
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
     const ok = await handle!.submitText('/goal align with the handoff doc', {
