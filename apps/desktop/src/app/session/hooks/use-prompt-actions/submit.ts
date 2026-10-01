@@ -7,7 +7,7 @@ import { type ChatMessage, finalizeInterruptedMessages, textPart } from '@/lib/c
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
-import { refreshIfTranscriptStale } from '@/lib/stale-transcript-guard'
+import { transcriptRefreshIfBehind } from '@/lib/stale-transcript-guard'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -850,7 +850,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         if (guardStoredId && liveSessionId) {
           const localSnapshot = updateSessionState(liveSessionId, state => state, targetStoredSessionId)
 
-          const refreshed = await refreshIfTranscriptStale(guardStoredId, localSnapshot.messages, {
+          const refresh = await transcriptRefreshIfBehind(guardStoredId, localSnapshot.messages, {
             excludeMessageId: optimisticId,
             profile: profileScopeForTranscriptSession(resolveActiveTranscriptSession(guardStoredId, liveSessionId))
           })
@@ -859,31 +859,48 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             return abortForSessionSwitch(liveSessionId)
           }
 
-          if (refreshed) {
-            updateSessionState(
-              liveSessionId,
-              state => ({
-                ...state,
-                awaitingResponse: false,
-                busy: false,
-                messages: refreshed,
-                pendingBranchGroup: null
-              }),
-              targetStoredSessionId
-            )
+          if (refresh) {
+            if (refresh.competingView) {
+              updateSessionState(
+                liveSessionId,
+                state => ({
+                  ...state,
+                  awaitingResponse: false,
+                  busy: false,
+                  messages: refresh.messages,
+                  pendingBranchGroup: null
+                }),
+                targetStoredSessionId
+              )
 
-            if (targetIsCurrentView()) {
-              scope.setMessages(() => refreshed)
-              notify({
-                kind: 'warning',
-                message: copy.staleSessionBody,
-                title: copy.staleSessionTitle
-              })
+              if (targetIsCurrentView()) {
+                scope.setMessages(() => refresh.messages)
+                notify({
+                  kind: 'warning',
+                  message: copy.staleSessionBody,
+                  title: copy.staleSessionTitle
+                })
+              }
+
+              releaseBusy()
+
+              return false
             }
 
-            releaseBusy()
-
-            return false
+            // The surplus was this window's own server-side turn residue — a turn
+            // that died on an approval timeout leaves its tool/assistant rows
+            // server-side while the window only holds its optimistic user message
+            // (#124005). Graft the rows into the view silently and let the send
+            // proceed: the local view being behind is the expected aftermath of the
+            // turn's death, not evidence of a competing view.
+            updateSessionState(
+              liveSessionId,
+              state => ({ ...state, messages: refresh.messages }),
+              targetStoredSessionId
+            )
+            if (targetIsCurrentView()) {
+              scope.setMessages(() => refresh.messages)
+            }
           }
         }
 
@@ -917,10 +934,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // other session-scoped RPC (attach, /compress, rewind, interrupt) goes
         // through the same helper so one policy covers the whole bug class.
         let submitErr: unknown = null
+        // The identity the backend actually accepted: the live runtime id,
+        // replaced below when a stale binding was recovered.
+        let acceptedRuntimeSessionId = liveSessionId
+        // Hoisted out of the recovery call so the acceptance report can name
+        // the durable session even when no recovery was needed.
+        const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
         try {
-          const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
-
           // A bot's chat is a tile scoped to the `bots` workspace; the primary chat is Sessions mode.
           noteMessageSent($sessionTiles.get().find(tile => tile.runtimeId === sessionId)?.workspaceMode ?? 'sessions')
 
@@ -982,6 +1003,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               }
             })
           }
+
+          acceptedRuntimeSessionId = submitted.sessionId
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
@@ -995,6 +1018,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         if (submitErr !== null) {
           throw submitErr
         }
+
+        // The prompt is now accepted. Report the EXACT identity it landed on
+        // (recovered id included) so a caller that must prove delivery — the
+        // Quick Entry bridge — never guesses the foreground session. Fires
+        // before the local cleanup below: acceptance is already true even if a
+        // later local step throws.
+        options?.onAccepted?.({
+          runtimeSessionId: acceptedRuntimeSessionId,
+          storedSessionId: recoverStoredSessionId ?? null
+        })
 
         if (usingComposerAttachments) {
           // A submit owns only the occurrences that actually reached the
