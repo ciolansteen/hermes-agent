@@ -254,6 +254,10 @@ class TestSummarizeToolResultOutcome:
         ("some_mcp_tool", {"a": 1}, {"error": "boom"}, "[some_mcp_tool] a=1 (17 chars result) FAILED: boom"),
         ("delegate_task", {"goal": "ship it"}, {"error": "Unknown action"},
          "[delegate_task] 'ship it' (27 chars result) FAILED: Unknown action"),
+        # The stale-write guard refused: nothing was written, so the stub must not say "wrote to".
+        ("write_file", {"path": "a.md", "content": "line 1\nline 2"},
+         {"error": "Refusing to overwrite a.md: stale", "stale_write_blocked": True},
+         "[write_file] a.md FAILED: Refusing to overwrite a.md: stale"),
     ])
     def test_failed_call_stub_is_marked_failed(self, tool_name, args, payload, expected):
         assert self._stub(tool_name, args, payload) == expected
@@ -261,6 +265,8 @@ class TestSummarizeToolResultOutcome:
     @pytest.mark.parametrize("tool_name, args, payload, expected", [
         ("web_search", {"query": "hermes"}, {"results": [{"title": "hit"}]},
          "[web_search] query='hermes' (31 chars result)"),
+        ("write_file", {"path": "a.md", "content": "line 1\nline 2"}, {"bytes_written": 13},
+         "[write_file] wrote to a.md (2 lines)"),
         ("text_to_speech", {}, {"success": True, "path": "/tmp/out.wav"}, "[text_to_speech] generated audio (41 chars)"),
         # ``job`` carries stored state from earlier runs; only this call's outcome may mark the stub.
         ("cronjob_manage", {"action": "poll"},
